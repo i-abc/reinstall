@@ -2,7 +2,7 @@
 # shellcheck disable=SC2086
 
 set -eE
-confhome=https://raw.githubusercontent.com/bin456789/reinstall/main
+confhome=https://raw.githubusercontent.com/i-abc/reinstall/main
 
 this_script=$(realpath "$0")
 trap 'trap_err $LINENO $?' ERR
@@ -1291,7 +1291,7 @@ esac
 # https://github.com/XIU2/UserScript/blob/master/GithubEnhanced-High-Speed-Download.user.js#L31
 if [[ "$confhome" == http*://raw.githubusercontent.com/* ]] &&
     is_in_china; then
-    confhome=https://ghps.cc/$confhome
+    confhome=https://gh.888853.xyz/gh-love/$confhome
 fi
 
 # 以下目标系统不需要进入alpine

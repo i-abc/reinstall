@@ -1,5 +1,5 @@
 @echo off
-set confhome=https://raw.githubusercontent.com/bin456789/reinstall/main
+set confhome=https://raw.githubusercontent.com/i-abc/reinstall/main
 setlocal EnableDelayedExpansion
 
 :: Windows 7 SP1 winhttp 默认不支持 tls 1.2
@@ -33,7 +33,7 @@ if !errorlevel! == 0 (
 
     echo !confhome! | findstr /c:"://raw.githubusercontent.com/" >nul
     if !errorlevel! == 0 (
-        set confhome=https://ghps.cc/!confhome!
+        set confhome=https://gh.888853.xyz/gh-love/!confhome!
     )
 ) else (
     :: mirrors.kernel.org 在荷兰太慢
