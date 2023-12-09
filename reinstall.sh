@@ -3,6 +3,7 @@
 
 set -eE
 confhome=https://raw.githubusercontent.com/i-abc/reinstall/main
+github_proxy=https://gh.888853.xyz/gh-love
 
 this_script=$(realpath "$0")
 trap 'trap_err $LINENO $?' ERR
@@ -23,7 +24,7 @@ Usage: reinstall.sh centos   7|8|9
                     fedora   37|38
                     debian   10|11|12
                     ubuntu   20.04|22.04
-                    alpine   3.16|3.17|3.18
+                    alpine   3.16|3.17|3.18|3.19
                     opensuse 15.4|15.5|tumbleweed
                     arch
                     gentoo
@@ -62,6 +63,7 @@ error_and_exit() {
 curl() {
     # 添加 -f, --fail，不然 404 退出码也为0
     # 32位 cygwin 已停止更新，证书可能有问题，先添加 --insecure
+    grep -o 'http[^ ]*' <<<"$@" >&2
     command curl --insecure --connect-timeout 5 --retry 2 --retry-delay 1 -f "$@"
 }
 
@@ -128,6 +130,10 @@ is_netboot_xyz() {
     [ "$distro" = netboot.xyz ]
 }
 
+is_alpine_live() {
+    [ "$distro" = alpine ] && [ "$hold" = 1 ]
+}
+
 is_have_initrd() {
     ! is_netboot_xyz
 }
@@ -175,7 +181,6 @@ test_url_real() {
     expect_type=$3
     var_to_eval=$4
     info test url
-    echo $url
 
     failed() {
         $grace && return 1
@@ -282,7 +287,7 @@ is_virt() {
         if [ -z "$_is_virt" ]; then
             _is_virt=false
         fi
-        echo "VM: $_is_virt"
+        echo "vm: $_is_virt"
     fi
     $_is_virt
 }
@@ -295,7 +300,7 @@ setos() {
 
     setos_netboot.xyz() {
         if is_efi; then
-            if [ "$basearch" == aarch64 ]; then
+            if [ "$basearch" = aarch64 ]; then
                 eval ${step}_efi=https://boot.netboot.xyz/ipxe/netboot.xyz-arm64.efi
             else
                 eval ${step}_efi=https://boot.netboot.xyz/ipxe/netboot.xyz.efi
@@ -309,7 +314,7 @@ setos() {
         flavour=lts
         if is_virt; then
             # alpine aarch64 3.18 才有 virt 直连链接
-            if [ "$basearch" == aarch64 ]; then
+            if [ "$basearch" = aarch64 ]; then
                 install_pkg bc
                 (($(echo "$releasever >= 3.18" | bc))) && flavour=virt
             else
@@ -372,15 +377,28 @@ setos() {
     }
 
     setos_ubuntu() {
+        case "$releasever" in
+        20.04) codename=focal ;;
+        22.04) codename=jammy ;;
+        esac
+
         if is_use_cloud_image; then
             # cloud image
-            # TODO: Minimal 镜像
             if is_in_china; then
                 ci_mirror=https://mirror.nju.edu.cn/ubuntu-cloud-images
             else
                 ci_mirror=https://cloud-images.ubuntu.com
             fi
+
             eval ${step}_img=$ci_mirror/releases/$releasever/release/ubuntu-$releasever-server-cloudimg-$basearch_alt.img
+
+            # minimal 镜像内核风味是 kvm，后台 vnc 无显示
+            # 没有 aarch64 minimal 镜像
+            # TODO: 在 trans 里安装普通内核/云内核
+            use_minimal_image=false
+            if $use_minimal_image && [ "$basearch" = x86_64 ]; then
+                eval ${step}_img=$ci_mirror/minimal/releases/$codename/release/ubuntu-$releasever-minimal-cloudimg-$basearch_alt.img
+            fi
         else
             # 传统安装
             if is_in_china; then
@@ -398,6 +416,8 @@ setos() {
             # iso
             filename=$(curl -L $mirror | grep -oP "ubuntu-$releasever.*?-live-server-$basearch_alt.iso" | head -1)
             iso=$mirror/$filename
+            # 在 ubuntu 20.04 上，file 命令检测 ubuntu 22.04 iso 结果是 DOS/MBR boot sector
+            test_url $iso 'iso|dos/mbr'
             eval ${step}_iso=$iso
 
             # ks
@@ -440,51 +460,46 @@ setos() {
         # aria2 有 mata4 问题
         # https://download.opensuse.org/
 
-        # 清华源缺少 aarch64 tumbleweed appliances
-        # https://mirrors.tuna.tsinghua.edu.cn/opensuse/ports/aarch64/tumbleweed/appliances/
+        # 很多国内源缺少 aarch64 tumbleweed appliances
+        #                 https://download.opensuse.org/ports/aarch64/tumbleweed/appliances/
         #           https://mirrors.nju.edu.cn/opensuse/ports/aarch64/tumbleweed/appliances/
+        #          https://mirrors.ustc.edu.cn/opensuse/ports/aarch64/tumbleweed/appliances/
+        # https://mirrors.tuna.tsinghua.edu.cn/opensuse/ports/aarch64/tumbleweed/appliances/
 
         if is_in_china; then
-            mirror=https://mirrors.ustc.edu.cn/opensuse
+            mirror=https://mirror.sjtu.edu.cn/opensuse
         else
             mirror=https://mirror.fcix.net/opensuse
         fi
 
-        if grep -iq Tumbleweed <<<"$releasever"; then
-            # Tumbleweed
-            releasever=Tumbleweed
+        if [ "$releasever" = tumbleweed ]; then
+            # tumbleweed
             if [ "$basearch" = aarch64 ]; then
                 dir=ports/aarch64/tumbleweed/appliances
             else
                 dir=tumbleweed/appliances
             fi
+            file=openSUSE-Tumbleweed-Minimal-VM.$basearch-Cloud.qcow2
         else
             # 常规版本
-            # 如果用户输入的版本号是 15，需要查询小版本号
-            if ! grep -q '\.' <<<"$releasever"; then
-                releasever=$(curl -L https://download.opensuse.org/download/distribution/openSUSE-stable/appliances/boxes/?json |
-                    grep -oP "(?<=\"name\":\"Leap-)$releasever\.[0-9]*" | head -1)
-            fi
-            if [ "$releasever" = 15.4 ]; then
-                openstack=-OpenStack
-            fi
             dir=distribution/leap/$releasever/appliances
-            releasever=Leap-$releasever
+            file=openSUSE-Leap-$releasever-Minimal-VM.$basearch-Cloud.qcow2
         fi
 
         # 有专门的kvm镜像，openSUSE-Leap-15.5-Minimal-VM.x86_64-kvm-and-xen.qcow2，但里面没有cloud-init
-        eval ${step}_img=$mirror/$dir/openSUSE-$releasever-Minimal-VM.$basearch$openstack-Cloud.qcow2
+        eval ${step}_img=$mirror/$dir/$file
     }
 
     setos_windows() {
+        test_url $iso 'iso|dos/mbr'
         eval "${step}_iso='$iso'"
         eval "${step}_image_name='$image_name'"
     }
 
     # shellcheck disable=SC2154
     setos_dd() {
+        test_url $img 'xz|gzip' ${step}_img_type
         eval "${step}_img='$img'"
-        eval "${step}_img_type='$img_type'"
     }
 
     setos_redhat() {
@@ -562,10 +577,14 @@ setos() {
             eval ${step}_ks=$confhome/redhat.cfg
             eval ${step}_vmlinuz=${mirror}images/pxeboot/vmlinuz
             eval ${step}_initrd=${mirror}images/pxeboot/initrd.img
-            eval ${step}_squashfs=${mirror}images/install.img
+
             if [ "$releasever" = 7 ]; then
-                eval ${step}_squashfs=${mirror}LiveOS/squashfs.img
+                squashfs=${mirror}LiveOS/squashfs.img
+            else
+                squashfs=${mirror}images/install.img
             fi
+            test_url $squashfs 'squashfs'
+            eval ${step}_squashfs=$squashfs
         fi
     }
 
@@ -574,6 +593,12 @@ setos() {
         setos_redhat
     else
         setos_$distro
+    fi
+
+    # 集中测试云镜像格式
+    if is_use_cloud_image && [ "$step" = finalos ]; then
+        # shellcheck disable=SC2154
+        test_url $finalos_img 'xz|gzip|qemu' finalos_img_type
     fi
 }
 
@@ -594,8 +619,8 @@ verify_os_name() {
         'fedora   37|38' \
         'debian   10|11|12' \
         'ubuntu   20.04|22.04' \
-        'alpine   3.16|3.17|3.18' \
-        'opensuse 15|15.4|15.5|tumbleweed' \
+        'alpine   3.16|3.17|3.18|3.19' \
+        'opensuse 15.4|15.5|tumbleweed' \
         'arch' \
         'gentoo' \
         'windows' \
@@ -652,8 +677,8 @@ install_pkg() {
 
     find_pkg_mgr() {
         if [ -z "$pkg_mgr" ]; then
-            for c in dnf yum apt pacman zypper emerge apk; do
-                is_have_cmd $c && pkg_mgr=$c && return
+            for mgr in dnf yum apt pacman zypper emerge apk; do
+                is_have_cmd $mgr && pkg_mgr=$mgr && return
             done
             return 1
         fi
@@ -953,8 +978,7 @@ install_grub_win() {
     info download grub
     grub_ver=2.06
     is_in_china && grub_url=https://mirrors.tuna.tsinghua.edu.cn/gnu/grub/grub-$grub_ver-for-windows.zip ||
-        grub_url=https://mirror.fcix.net/gnu/grub/grub-$grub_ver-for-windows.zip
-    echo $grub_url
+        grub_url=https://ftpmirror.gnu.org/gnu/grub/grub-$grub_ver-for-windows.zip
     curl -Lo /tmp/grub.zip $grub_url
     # unzip -qo /tmp/grub.zip
     7z x /tmp/grub.zip -o/tmp -r -y -xr!i386-efi -xr!locale -xr!themes -bso0
@@ -1049,24 +1073,37 @@ get_entry_name() {
 }
 
 # shellcheck disable=SC2154
-build_cmdline() {
-    if [ -n "$finalos_cmdline" ]; then
-        # 有 finalos_cmdline 表示需要两步安装
-        # 两步安装需要修改 alpine initrd
-        mod_alpine_initrd
-
-        # 可添加 pkgs=xxx,yyy 启动时自动安装
-        # apkovl=http://xxx.com/apkovl.tar.gz 可用，arm https未测但应该不行
-        # apkovl=sda2:ext4:/apkovl.tar.gz 官方有写但不生效
-        cmdline="alpine_repo=$nextos_repo modloop=$nextos_modloop $extra_cmdline $finalos_cmdline"
+build_nextos_cmdline() {
+    if [ $nextos_distro = alpine ]; then
+        nextos_cmdline="alpine_repo=$nextos_repo modloop=$nextos_modloop"
+    elif [ $nextos_distro = debian ]; then
+        nextos_cmdline="lowmem=+1 lowmem/low=1 auto=true priority=critical url=$nextos_ks"
     else
-        if [ $distro = debian ]; then
-            cmdline="lowmem=+1 lowmem/low=1 auto=true priority=critical url=$nextos_ks $extra_cmdline"
-        else
-            # redhat
-            cmdline="root=live:$nextos_squashfs inst.ks=$nextos_ks $extra_cmdline"
-        fi
+        # redhat
+        nextos_cmdline="root=live:$nextos_squashfs inst.ks=$nextos_ks"
     fi
+
+    nextos_cmdline+=" $(echo_tmp_ttys)"
+    # nextos_cmdline+=" mem=256M"
+}
+
+build_cmdline() {
+    # nextos
+    build_nextos_cmdline
+
+    # finalos
+    # trans 需要 finalos_distro 识别是安装 alpine 还是其他系统
+    if [ "$distro" = alpine ]; then
+        finalos_distro=alpine
+    fi
+    if [ -n "$finalos_distro" ]; then
+        build_finalos_cmdline
+    fi
+
+    # extra
+    build_extra_cmdline
+
+    cmdline="$nextos_cmdline $finalos_cmdline $extra_cmdline"
 }
 
 # 脚本可能多次运行，先清理之前的残留
@@ -1123,17 +1160,28 @@ mod_alpine_initrd() {
         modprobe ipv6
 EOF
 
-    # hack 2
+    # hack 2 设置 ethx
+    ip_choose_if() {
+        ip -o link | grep "@mac_addr" | awk '{print $2}' | cut -d: -f1
+        return
+    }
+
+    collect_netconf
+    get_function_content ip_choose_if | sed "s/@mac_addr/$mac_addr/" | insert_into_file init after 'ip_choose_if\(\)'
+
+    # hack 3
     # udhcpc 添加 -n 参数，请求dhcp失败后退出
     # 使用同样参数运行 udhcpc6
     # TODO: digitalocean -i eth1?
-    # shellcheck disable=SC2016
-    orig_cmd="$(grep '$MOCK udhcpc' init)"
+    # $MOCK udhcpc -i "$device" -f -q # v3.18
+    #       udhcpc -i "$device" -f -q # v3.17
+    search='udhcpc -i'
+    orig_cmd="$(grep "$search" init)"
     mod_cmd4="$orig_cmd -n || true"
     mod_cmd6="${mod_cmd4//udhcpc/udhcpc6}"
-    sed -i "/\$MOCK udhcpc/c$mod_cmd4 \n $mod_cmd6" init
+    sed -i "/$search/c$mod_cmd4 \n $mod_cmd6" init
 
-    # hack 3 /usr/share/udhcpc/default.script
+    # hack 4 /usr/share/udhcpc/default.script
     # 脚本被调用的顺序
     # udhcpc:  deconfig
     # udhcpc:  bound
@@ -1157,8 +1205,7 @@ EOF
     # 允许设置 ipv4 onlink 网关
     sed -Ei 's,(0\.0\.0\.0\/0),"\1 onlink",' usr/share/udhcpc/default.script
 
-    # hack 4 网络配置
-    collect_netconf
+    # hack 5 网络配置
     is_in_china && is_in_china=true || is_in_china=false
     insert_into_file init after 'MAC_ADDRESS=' <<EOF
         source /alpine-network.sh \
@@ -1188,8 +1235,8 @@ EOF
     # -c    Identical to "-H newc", use the new (SVR4)
     #       portable format.If you wish the old portable
     #       (ASCII) archive format, use "-H odc" instead.
-    find . | cpio -o -H newc | gzip -1 >/reinstall-initrd
-    cd -
+    find . | cpio --quiet -o -H newc | gzip -1 >/reinstall-initrd
+    cd - >/dev/null
 }
 
 # 脚本入口
@@ -1278,6 +1325,7 @@ fi
 
 # 检查硬件架构
 # x86强制使用x64
+# archlinux 云镜像没有 arch 命令
 basearch=$(uname -m)
 [ $basearch = i686 ] && basearch=x86_64
 case "$basearch" in
@@ -1289,41 +1337,29 @@ esac
 # gitee 不支持ipv6
 # jsdelivr 有12小时缓存
 # https://github.com/XIU2/UserScript/blob/master/GithubEnhanced-High-Speed-Download.user.js#L31
-if [[ "$confhome" == http*://raw.githubusercontent.com/* ]] &&
-    is_in_china; then
-    confhome=https://gh.888853.xyz/gh-love/$confhome
+if [ -n "$github_proxy" ] && [[ "$confhome" = http*://raw.githubusercontent.com/* ]] && is_in_china; then
+    confhome=$github_proxy/$confhome
 fi
 
-# 以下目标系统不需要进入alpine
+# 以下目标系统不需要两步安装
+# alpine
 # debian
 # el7 x86_64 >=1g
 # el7 aarch64 >=1.5g
 # el8/9/fedora 任何架构 >=2g
 if is_netboot_xyz ||
     { ! is_use_cloud_image && {
-        [ "$distro" = "debian" ] ||
+        [ "$distro" = "alpine" ] || [ "$distro" = "debian" ] ||
             { is_distro_like_redhat "$distro" && [ $releasever -eq 7 ] && [ $ram_size -ge 1024 ] && [ $basearch = "x86_64" ]; } ||
             { is_distro_like_redhat "$distro" && [ $releasever -eq 7 ] && [ $ram_size -ge 1536 ] && [ $basearch = "aarch64" ]; } ||
             { is_distro_like_redhat "$distro" && [ $releasever -ge 8 ] && [ $ram_size -ge 2048 ]; }
     }; }; then
     setos nextos $distro $releasever
 else
-    # 安装alpine时，使用指定的版本。 alpine作为中间系统时，使用 3.18
-    [ "$distro" = "alpine" ] && alpine_releasever=$releasever || alpine_releasever=3.18
+    # alpine 作为中间系统时，使用 3.19
+    alpine_ver_for_trans=3.19
     setos finalos $distro $releasever
-    setos nextos alpine $alpine_releasever
-fi
-
-# 测试链接
-# 在 ubuntu 20.04 上，file 命令检测 ubuntu 22.04 iso 结果不正确，所以去掉 iso 检测
-if is_use_cloud_image; then
-    test_url $finalos_img 'xz|gzip|qemu' finalos_img_type
-elif is_use_dd; then
-    test_url $finalos_img 'xz|gzip' finalos_img_type
-elif [ -n "$finalos_img" ]; then
-    test_url $finalos_img
-elif [ -n "$finalos_iso" ]; then
-    test_url $finalos_iso
+    setos nextos alpine $alpine_ver_for_trans
 fi
 
 # 删除之前的条目
@@ -1379,15 +1415,12 @@ if is_netboot_xyz; then
 else
     # 下载 nextos 内核
     info download vmlnuz and initrd
-    echo $nextos_vmlinuz
     curl -Lo /reinstall-vmlinuz $nextos_vmlinuz
-
-    echo $nextos_initrd
     curl -Lo /reinstall-initrd $nextos_initrd
 
-    build_finalos_cmdline
-    build_extra_cmdline
-    build_cmdline
+    if [ "$nextos_distro" = alpine ]; then
+        mod_alpine_initrd
+    fi
 fi
 
 if is_use_grub; then
@@ -1395,7 +1428,8 @@ if is_use_grub; then
     # linux grub
     if ! is_in_windows; then
         if is_have_cmd update-grub; then
-            grub_cfg=$(grep -o '[^ ]*grub.cfg' "$(get_cmd_path update-grub)")
+            # alpine debian ubuntu
+            grub_cfg=$(grep -o '[^ ]*grub.cfg' "$(get_cmd_path update-grub)" | head -1)
         else
             # 找出主配置文件（含有menuentry|blscfg）
             # 如果是efi，先搜索efi目录
@@ -1430,14 +1464,16 @@ if is_use_grub; then
 
     # 生成 custom.cfg (linux) 或者 grub.cfg (win)
     is_in_windows && custom_cfg=/cygdrive/$c/grub.cfg || custom_cfg=$(dirname $grub_cfg)/custom.cfg
-    echo $custom_cfg
 
     if is_netboot_xyz; then
         linux_cmd="linux16 /reinstall-vmlinuz"
     else
-        linux_cmd="linux$efi /reinstall-vmlinuz $(echo_tmp_ttys) $cmdline"
+        build_cmdline
+        linux_cmd="linux$efi /reinstall-vmlinuz $cmdline"
         initrd_cmd="initrd$efi /reinstall-initrd"
     fi
+
+    echo $custom_cfg
     cat <<EOF | tee $custom_cfg
 set timeout=5
 menuentry "$(get_entry_name)" {
@@ -1468,14 +1504,22 @@ EOF
     fi
 fi
 
-if is_use_cloud_image; then
-    info 'cloud image mode'
+info 'info'
+echo "$distro $releasever"
+if is_netboot_xyz; then
+    echo 'Reboot to start netboot.xyz.'
+elif is_alpine_live; then
+    echo 'Reboot to start Alpine Live OS.'
 elif is_use_dd; then
-    info 'dd mode'
-elif is_netboot_xyz; then
-    info 'boot into netboot.xyz'
+    echo 'Reboot to start DD.'
 else
-    info 'installer mode'
-fi
+    if [ "$distro" = windows ]; then
+        username="administrator"
+    else
+        username="root"
+    fi
 
-info 'Please reboot to begin the installation'
+    echo "Username: $username"
+    echo "Password: 123@@@"
+    echo "Reboot to start the installation."
+fi

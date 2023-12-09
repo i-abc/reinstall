@@ -1,5 +1,8 @@
 # reinstall
 
+[![Codacy Badge](https://app.codacy.com/project/badge/Grade/dc679a17751448628fe6d8ac35e26eed)](https://app.codacy.com/gh/bin456789/reinstall/dashboard?utm_source=gh&utm_medium=referral&utm_content=&utm_campaign=Badge_grade)
+[![CodeFactor](https://www.codefactor.io/repository/github/bin456789/reinstall/badge)](https://www.codefactor.io/repository/github/bin456789/reinstall)
+
 又一个重装脚本
 
 ## 亮点
@@ -26,10 +29,12 @@ curl -O https://raw.githubusercontent.com/i-abc/reinstall/main/reinstall.sh
 ### 下载 (国内)
 
 ```bash
-curl -O https://gh.888853.xyz/gh-love/https://raw.githubusercontent.com/i-abc/reinstall/main/reinstall.sh
+curl -O https://ghps.cc/https://raw.githubusercontent.com/i-abc/reinstall/main/reinstall.sh
 ```
 
 ### 用法 1: 安装 Linux
+
+注意：静态 IP 的机器安装 centos、alma、rocky、fedora、debian、ubuntu，需添加参数 --ci 强制使用云镜像
 
 ```bash
 bash reinstall.sh centos   7|8|9  (8|9 为 stream 版本)
@@ -38,7 +43,7 @@ bash reinstall.sh centos   7|8|9  (8|9 为 stream 版本)
                   fedora   37|38
                   debian   10|11|12
                   ubuntu   20.04|22.04
-                  alpine   3.16|3.17|3.18
+                  alpine   3.16|3.17|3.18|3.19
                   opensuse 15.4|15.5|tumbleweed (只支持云镜像)
                   arch     (只支持 amd64 云镜像)
                   gentoo   (只支持 amd64 云镜像)
@@ -130,7 +135,7 @@ certutil -urlcache -f -split https://raw.githubusercontent.com/i-abc/reinstall/m
 ### 下载（国内）
 
 ```batch
-certutil -urlcache -f -split https://gh.888853.xyz/gh-love/https://raw.githubusercontent.com/i-abc/reinstall/main/reinstall.bat
+certutil -urlcache -f -split https://ghps.cc/https://raw.githubusercontent.com/i-abc/reinstall/main/reinstall.bat
 ```
 
 ### 如果无法下载

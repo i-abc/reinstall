@@ -69,7 +69,6 @@ download() {
     path=$2
     echo $url
 
-    # 阿里云源禁止 axel 下载，检测 user-agent
     # 有ipv4地址无ipv4网关的情况下，aria2可能会用ipv4下载，而不是ipv6
     # axel 在 lightsail 上会占用大量cpu
     # aria2 下载 fedora 官方镜像链接会将meta4文件下载下来，而且占用了指定文件名，造成重命名失效。而且无法指定目录
@@ -95,20 +94,34 @@ download() {
         apk add aria2 coreutils
     fi
 
-    # 默认 --max-tries 5
-    stdbuf -o0 -e0 aria2c -x4 --allow-overwrite=true --summary-interval=0 $save $url
+    # 阿里云源检测 user-agent 禁止 axel/aria2 下载
+    # aria2 默认 --max-tries 5
+    stdbuf -o0 -e0 \
+        aria2c -x4 \
+        --allow-overwrite=true \
+        --summary-interval=0 \
+        --user-agent=Wget/1.21.1 \
+        $save $url
 }
 
 update_part() {
-    {
-        set +e
-        hdparm -z $1
-        partprobe $1
+    # partx
+    # https://access.redhat.com/solutions/199573
+    if is_have_cmd partx; then
         partx -u $1
+    fi
+
+    if rc-service --exists udev && rc-service udev status; then
+        # udev
+        udevadm trigger
         udevadm settle
-        echo 1 >/sys/block/${1#/dev/}/device/rescan
-        set -e
-    } 2>/dev/null || true
+    else
+        # busybox mdev
+        # 得刷新多次，不然找不到新分区
+        # -f 好像没用，而且 3.16 没有
+        mdev -s 2>/dev/null
+        mdev -s 2>/dev/null
+    fi
 }
 
 is_efi() {
@@ -133,9 +146,22 @@ setup_nginx() {
     fi
 }
 
+get_approximate_ram_size() {
+    # lsmem 需要 util-linux
+    if is_have_cmd lsmem; then
+        ram_size=$(lsmem -b 2>/dev/null | grep 'Total online memory:' | awk '{ print $NF/1024/1024 }')
+    fi
+
+    if [ -z $ram_size ]; then
+        ram_size=$(free -m | awk '{print $2}' | sed -n '2p')
+    fi
+
+    echo "$ram_size"
+}
+
 setup_nginx_if_enough_ram() {
-    total_ram=$(free -m | awk '{print $2}' | sed -n '2p')
-    # 避免后面没内存安装程序，谨慎起见，512内存才安装
+    total_ram=$(get_approximate_ram_size)
+    # 512内存才安装
     if [ $total_ram -gt 400 ]; then
         # lighttpd 虽然运行占用内存少，但安装占用空间大
         # setup_lighttpd
@@ -149,9 +175,14 @@ setup_lighttpd() {
     rc-service lighttpd start
 }
 
-# 最后一个 tty 是主tty，显示的信息最多
-# 有些平台例如 aws/gcp 只能截图，不能输入（没有鼠标）
-# 所以如果有显示器且有鼠标，tty0 放最后面，否则 tty0 放前面
+setup_udev_util_linux() {
+    # mdev 不会删除 /sys/block/by-label 的旧分区名，所以用 udev
+    # util-linux 包含 lsblk
+    # util-linux 可自动探测 mount 格式
+    apk add udev util-linux
+    rc-service udev start
+}
+
 get_ttys() {
     prefix=$1
     # shellcheck disable=SC2154
@@ -199,32 +230,42 @@ qemu_nbd() {
 
 mod_motd() {
     # 安装后 alpine 后要恢复默认
-    if [ "$distro" = alpine ]; then
-        cp /etc/motd /etc/motd.orig
+    # 自动安装失败后，可能手动安装 alpine，因此无需判断 $distro
+    file=/etc/motd
+    if ! [ -e $file.orig ]; then
+        cp $file $file.orig
         # shellcheck disable=SC2016
-        echo 'mv /etc/motd.orig /etc/motd' |
-            insert_into_file /sbin/setup-disk after 'mount -t \$ROOTFS \$root_dev "\$SYSROOT"'
-    fi
+        echo "mv "\$mnt$file.orig" "\$mnt$file"" |
+            insert_into_file /sbin/setup-disk before 'cleanup_chroot_mounts "\$mnt"'
 
-    cat <<EOF >/etc/motd
+        cat <<EOF >$file
 Reinstalling...
 To view logs run:
 tail -fn+1 /reinstall.log
 EOF
+    fi
+}
+
+umount_all() {
+    dirs="/os /iso /wim /installer /nbd /nbd-boot /nbd-efi /root"
+    regex=$(echo "$dirs" | sed 's, ,|,g')
+    if mounts=$(mount | grep -Ew "$regex" | awk '{print $3}' | tac); then
+        for mount in $mounts; do
+            echo "umount $mount"
+            umount $mount
+        done
+    fi
 }
 
 # 可能脚本不是首次运行，先清理之前的残留
 clear_previous() {
-    {
-        # TODO: fuser and kill
-        set +e
-        qemu_nbd -d /dev/nbd0
-        swapoff -a
-        # alpine 自带的umount没有-R，除非安装了util-linux
-        umount -R /iso /wim /installer /os/installer /os /nbd /nbd-boot /nbd-efi /mnt
-        umount /iso /wim /installer /os/installer /os /nbd /nbd-boot /nbd-efi /mnt
-        set -e
-    } 2>/dev/null || true
+    qemu_nbd -d /dev/nbd0 2>/dev/null || true
+    swapoff -a
+    umount_all
+
+    # 以下情况 umount -R /1 会提示 busy
+    # mount /file1 /1
+    # mount /1/file2 /2
 }
 
 get_virt_to() {
@@ -246,7 +287,9 @@ get_ra_to() {
         apk add ndisc6
         # 有时会重复收取，所以设置收一份后退出
         echo "Gathering network info..."
-        _ra="$(rdisc6 -1 eth0)"
+        get_netconf_to ethx
+        # shellcheck disable=SC2154
+        _ra="$(rdisc6 -1 "$ethx")"
         apk del ndisc6
 
         # 显示网络配置
@@ -432,8 +475,11 @@ insert_into_file() {
 }
 
 install_alpine() {
-    hack_lowram=true
-    if $hack_lowram; then
+    hack_lowram_modloop=true
+    hack_lowram_swap=true
+    mount / -o remount,size=100%
+
+    if $hack_lowram_modloop; then
         # 预先加载需要的模块
         if rc-service modloop status; then
             modules="ext4 vfat nls_utf8 nls_cp437 crc32c"
@@ -445,39 +491,30 @@ install_alpine() {
         # 删除 modloop ，释放内存
         rc-service modloop stop
         rm -f /lib/modloop-lts /lib/modloop-virt
-
-        # 复制一份原版，防止再次运行时出错
-        if [ -e /sbin/setup-disk.orig ]; then
-            cp -f /sbin/setup-disk.orig /sbin/setup-disk
-        else
-            cp -f /sbin/setup-disk /sbin/setup-disk.orig
-        fi
-
-        # 格式化系统分区、mount 后立即开启 swap
-        # shellcheck disable=SC2016
-        insert_into_file /sbin/setup-disk after 'mount -t \$ROOTFS \$root_dev "\$SYSROOT"' <<EOF
-            fallocate -l 1G /mnt/swapfile
-            chmod 0600 /mnt/swapfile
-            mkswap /mnt/swapfile
-            swapon /mnt/swapfile
-            rc-update add swap boot
-EOF
-
-        # 安装完成后写入 swapfile 到 fstab
-        # shellcheck disable=SC2016
-        insert_into_file /sbin/setup-disk after 'install_mounted_root "\$SYSROOT" "\$disks"' <<EOF
-            echo "/swapfile swap swap defaults 0 0" >>/mnt/etc/fstab
-EOF
     fi
 
-    # scaleway block volume optimal_io_size 是 4M
-    # setup-disk 用 cfdisk 从 1M 开始分区
-    # 但 cfdisk 只能按 optimal_io_size 对齐分区，因此报错
-    # 将 start 置空，则自动对齐到 optimal_io_size
-    # https://oss.oracle.com/~mkp/docs/linux-advanced-storage.pdf
-    if [ -f /sys/block/$xda/queue/optimal_io_size ] &&
-        [ "$(cat /sys/block/$xda/queue/optimal_io_size)" -gt $((1024 * 1024)) ]; then
-        sed -i 's/start=1M/start=/' /sbin/setup-disk
+    # bios机器用 setup-disk 自动分区会有 boot 分区
+    # 因此手动分区安装
+    create_part
+
+    # 挂载系统分区
+    if is_efi || is_xda_gt_2t; then
+        os_part_num=2
+    else
+        os_part_num=1
+    fi
+    mkdir -p /os
+    mount -t ext4 /dev/${xda}*${os_part_num} /os
+
+    # 挂载 efi
+    if is_efi; then
+        mkdir -p /os/boot/efi
+        mount -t vfat /dev/${xda}*1 /os/boot/efi
+    fi
+
+    # 创建 swap
+    if $hack_lowram_swap; then
+        create_swap 256 /os/swapfile
     fi
 
     # 网络
@@ -500,23 +537,25 @@ EOF
     sed -i '/^#slaac hwaddr/s/^#//' /etc/dhcpcd.conf
     rc-update add networking boot
 
-    # 生成 lo配置 + eth0头部
+    get_netconf_to ethx
+
+    # 生成 lo配置 + ethx头部
     cat <<EOF >/etc/network/interfaces
 auto lo
 iface lo inet loopback
 
-auto eth0
+auto $ethx
 EOF
 
     # ipv4
     if is_dhcpv4; then
-        echo "iface eth0 inet dhcp" >>/etc/network/interfaces
+        echo "iface $ethx inet dhcp" >>/etc/network/interfaces
 
     elif is_staticv4; then
         get_netconf_to ipv4_addr
         get_netconf_to ipv4_gateway
         cat <<EOF >>/etc/network/interfaces
-iface eth0 inet static
+iface $ethx inet static
     address $ipv4_addr
     gateway $ipv4_gateway
 EOF
@@ -532,16 +571,16 @@ EOF
 
     # ipv6
     if is_slaac; then
-        echo 'iface eth0 inet6 auto' >>/etc/network/interfaces
+        echo "iface $ethx inet6 auto" >>/etc/network/interfaces
 
     elif is_dhcpv6; then
-        echo 'iface eth0 inet6 dhcp' >>/etc/network/interfaces
+        echo "iface $ethx inet6 dhcp" >>/etc/network/interfaces
 
     elif is_staticv6; then
         get_netconf_to ipv6_addr
         get_netconf_to ipv6_gateway
         cat <<EOF >>/etc/network/interfaces
-iface eth0 inet6 static
+iface $ethx inet6 static
     address $ipv6_addr
     gateway $ipv6_gateway
 EOF
@@ -583,8 +622,10 @@ EOF
     if [ -e /dev/input/event0 ]; then
         rc-update add acpid
     fi
+
+    # 3.16 没有 seedrng
     rc-update add crond
-    rc-update add seedrng boot
+    rc-update add seedrng boot || true
 
     # 如果是 vm 就用 virt 内核
     if is_virt; then
@@ -600,12 +641,40 @@ EOF
         setup-apkrepos -1
     fi
 
+    # 修复3.16安装后无法引导
+    # https://github.com/alpinelinux/alpine-conf/commit/bc7aeab868bf4d94dde2ff5d6eb97daede5975b9
+    if grep -F '3.16' /etc/alpine-release; then
+        file=/sbin/setup-disk
+        if ! [ -e $file.orig ]; then
+            cp $file $file.orig
+            # shellcheck disable=SC2016
+            echo 'apk add --quiet $(select_bootloader_pkg)' |
+                insert_into_file $file after '# install to given mounted root'
+        fi
+    fi
+
     # 安装到硬盘
     # alpine默认使用 syslinux (efi 环境除外)，这里强制使用 grub，方便用脚本再次重装
     KERNELOPTS="$(get_ttys console=)"
     export KERNELOPTS
     export BOOTLOADER="grub"
-    printf 'y' | setup-disk -m sys -k $kernel_flavor -s 0 /dev/$xda
+    printf 'y' | setup-disk -m sys -k $kernel_flavor /os
+
+    # 3.19 或以上，非 efi 需要手动安装 grub
+    if ! is_efi && grep -F '3.19' /etc/alpine-release; then
+        grub-install --boot-directory=/os/boot --target=i386-pc /dev/$xda
+    fi
+
+    # 是否保留 swap
+    if [ -e /os/swapfile ]; then
+        if false; then
+            echo "/swapfile swap swap defaults 0 0" >>/os/etc/fstab
+            ln -sf /etc/init.d/swap /os/etc/runlevels/boot/swap
+        else
+            swapoff -a
+            rm /os/swapfile
+        fi
+    fi
 }
 
 get_http_file_size_to() {
@@ -647,19 +716,13 @@ is_xda_gt_2t() {
 }
 
 create_part() {
-    # 目标系统非 alpine 和 dd
-    # 脚本开始
-    apk add util-linux udev hdparm e2fsprogs parted
+    # 除了 dd 都会用到
 
-    # 打开dev才能刷新分区名
-    rc-service udev start
-
-    # 反激活 lvm
-    # alpine live 不需要
-    false && vgchange -an
-
-    # 移除 lsblk 显示的分区
-    partx -d /dev/$xda || true
+    # 分区工具
+    apk add parted e2fsprogs
+    if is_efi; then
+        apk add dosfstools
+    fi
 
     # 清除分区签名
     # TODO: 先检测iso链接/各种链接
@@ -669,20 +732,20 @@ create_part() {
     # shellcheck disable=SC2154
     if [ "$distro" = windows ]; then
         get_http_file_size_to size_bytes $iso
-        if [ -n "$size_bytes" ]; then
-            # 按iso容量计算分区大小，512m用于驱动和文件系统自身占用
-            part_size="$((size_bytes / 1024 / 1024 + 512))MiB"
-        else
-            # 默认值，最大的iso 23h2 需要7g
-            part_size="$((7 * 1024))MiB"
+
+        # 默认值，最大的iso 23h2 需要7g
+        if [ -z "$size_bytes" ]; then
+            size_bytes=$((7 * 1024 * 1024 * 1024))
         fi
+
+        # 按iso容量计算分区大小，200m用于驱动和文件系统自身占用
+        part_size="$((size_bytes / 1024 / 1024 + 200))MiB"
 
         apk add ntfs-3g-progs virt-what wimlib rsync
         # 虽然ntfs3不需要fuse，但wimmount需要，所以还是要保留
         modprobe fuse ntfs3
         if is_efi; then
             # efi
-            apk add dosfstools
             parted /dev/$xda -s -- \
                 mklabel gpt \
                 mkpart '" "' fat32 1MiB 1025MiB \
@@ -713,7 +776,6 @@ create_part() {
     elif is_use_cloud_image; then
         # 这几个系统不使用dd，而是复制文件，因为dd这几个系统的qcow2需要10g硬盘
         if { [ "$distro" = centos ] || [ "$distro" = alma ] || [ "$distro" = rocky ]; }; then
-            apk add dosfstools e2fsprogs
             if is_efi; then
                 parted /dev/$xda -s -- \
                     mklabel gpt \
@@ -751,6 +813,39 @@ create_part() {
 
             mkfs.ext4 -F -L os /dev/$xda*1        #1 os
             mkfs.ext4 -F -L installer /dev/$xda*2 #2 installer
+        fi
+    elif [ "$distro" = alpine ]; then
+        if is_efi; then
+            # efi
+            parted /dev/$xda -s -- \
+                mklabel gpt \
+                mkpart '" "' fat32 1MiB 101MiB \
+                mkpart '" "' ext4 101MiB 100% \
+                set 1 boot on
+            update_part /dev/$xda
+
+            mkfs.fat /dev/$xda*1     #1 efi
+            mkfs.ext4 -F /dev/$xda*2 #2 os
+        elif is_xda_gt_2t; then
+            # bios > 2t
+            parted /dev/$xda -s -- \
+                mklabel gpt \
+                mkpart '" "' ext4 1MiB 2MiB \
+                mkpart '" "' ext4 2MiB 100% \
+                set 1 bios_grub on
+            update_part /dev/$xda
+
+            echo                     #1 bios_boot
+            mkfs.ext4 -F /dev/$xda*2 #2 os
+        else
+            # bios
+            parted /dev/$xda -s -- \
+                mklabel msdos \
+                mkpart primary ext4 1MiB 100% \
+                set 1 boot on
+            update_part /dev/$xda
+
+            mkfs.ext4 -F /dev/$xda*1 #1 os
         fi
     else
         # 安装红帽系或ubuntu
@@ -808,6 +903,12 @@ create_part() {
     fi
 
     update_part /dev/$xda
+
+    # alpine 删除分区工具，防止 256M 小机爆内存
+    # setup-disk /dev/sda 会保留格式化工具，我们也保留
+    if [ "$distro" = alpine ]; then
+        apk del parted
+    fi
 }
 
 mount_pseudo_fs() {
@@ -826,13 +927,14 @@ mount_pseudo_fs() {
 create_cloud_init_network_config() {
     ci_file=$1
 
+    get_netconf_to ethx
     get_netconf_to mac_addr
     apk add yq
 
     # shellcheck disable=SC2154
     yq -i ".network.version=1 |
            .network.config[0].type=\"physical\" |
-           .network.config[0].name=\"eth0\" |
+           .network.config[0].name=\"$ethx\" |
            .network.config[0].mac_address=\"$mac_addr\" |
            .network.config[1].type=\"nameserver\"
            " $ci_file
@@ -1157,8 +1259,6 @@ EOF
 modify_os_on_disk() {
     only_process=$1
 
-    apk add util-linux udev hdparm lsblk
-    rc-service udev start
     update_part /dev/$xda
 
     # dd linux 的时候不用修改硬盘内容
@@ -1197,17 +1297,26 @@ modify_os_on_disk() {
     error_and_exit "Can't find os partition."
 }
 
+create_swap_if_ram_less_than() {
+    need_ram=$1
+    swapfile=$2
+
+    phy_ram=$(get_approximate_ram_size)
+    swapsize=$((need_ram - phy_ram))
+    if [ $swapsize -gt 0 ]; then
+        create_swap $swapsize $swapfile
+    fi
+}
+
 create_swap() {
-    swapfile=$1
+    swapsize=$1
+    swapfile=$2
+
     if ! grep $swapfile /proc/swaps; then
-        apk add util-linux
-        ram_size=$(lsmem -b 2>/dev/null | grep 'Total online memory:' | awk '{ print $NF/1024/1024 }')
-        if [ -z $ram_size ] || [ $ram_size -lt 1024 ]; then
-            fallocate -l 512M $swapfile
-            chmod 0600 $swapfile
-            mkswap $swapfile
-            swapon $swapfile
-        fi
+        fallocate -l ${swapsize}M $swapfile
+        chmod 0600 $swapfile
+        mkswap $swapfile
+        swapon $swapfile
     fi
 }
 
@@ -1240,7 +1349,7 @@ disable_selinux_kdump() {
 }
 
 download_qcow() {
-    apk add qemu-img lsblk
+    apk add qemu-img
 
     mkdir -p /installer
     mount /dev/disk/by-label/installer /installer
@@ -1327,7 +1436,7 @@ install_qcow_el() {
 
     # 创建 swap
     rm -rf /installer/*
-    create_swap /installer/swapfile
+    create_swap 1024 /installer/swapfile
 
     # resolv.conf
     cp /etc/resolv.conf /os/etc/resolv.conf
@@ -1532,6 +1641,7 @@ resize_after_install_cloud_image() {
                 e2fsck -p -f /dev/$xda*$system_part_num
                 resize2fs /dev/$xda*$system_part_num
             fi
+            update_part /dev/$xda
         fi
     fi
 }
@@ -1661,7 +1771,7 @@ install_windows() {
     fi
 
     # 变量名     使用场景
-    # arch_uname uname -m                      x86_64  aarch64
+    # arch_uname arch命令/uname -m             x86_64  aarch64
     # arch_wim   wiminfo                  x86  x86_64  ARM64
     # arch       virtio驱动/unattend.xml  x86  amd64   arm64
     # arch_xen   xen驱动                  x86  x64
@@ -1951,23 +2061,25 @@ EOF
     fi
 }
 
+# 添加 netboot.efi 备用
+download_netboot_xyz_efi() {
+    dir=$1
+
+    file=$dir/netboot.xyz.efi
+    if [ "$(uname -m)" = aarch64 ]; then
+        download https://boot.netboot.xyz/ipxe/netboot.xyz-arm64.efi $file
+    else
+        download https://boot.netboot.xyz/ipxe/netboot.xyz.efi $file
+    fi
+}
+
 install_redhat_ubuntu() {
     # 安装 grub2
     if is_efi; then
         # 注意低版本的grub无法启动f38 arm的内核
         # https://forums.fedoraforum.org/showthread.php?330104-aarch64-pxeboot-vmlinuz-file-format-changed-broke-PXE-installs
-
         apk add grub-efi efibootmgr
         grub-install --efi-directory=/os/boot/efi --boot-directory=/os/boot
-
-        # 添加 netboot 备用
-        arch_uname=$(uname -m)
-        cd /os/boot/efi
-        if [ "$arch_uname" = aarch64 ]; then
-            download https://boot.netboot.xyz/ipxe/netboot.xyz-arm64.efi
-        else
-            download https://boot.netboot.xyz/ipxe/netboot.xyz.efi
-        fi
     else
         apk add grub-bios
         grub-install --boot-directory=/os/boot /dev/$xda
@@ -2053,6 +2165,7 @@ fi
 
 mod_motd
 setup_tty_and_log
+cat /proc/cmdline
 clear_previous
 add_community_repo
 
@@ -2061,6 +2174,7 @@ xda=$(get_xda)
 
 if [ "$distro" != "alpine" ]; then
     setup_nginx_if_enough_ram
+    setup_udev_util_linux
 fi
 
 # dd qemu 切换成云镜像模式，暂时没用到
@@ -2102,6 +2216,8 @@ else
         install_redhat_ubuntu
     fi
 fi
+
+echo 'done'
 if [ "$hold" = 2 ]; then
     exit
 fi
