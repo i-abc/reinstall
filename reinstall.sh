@@ -3,7 +3,7 @@
 
 set -eE
 confhome=https://raw.githubusercontent.com/i-abc/reinstall/main
-github_proxy=https://gh.888853.xyz/gh-love
+github_proxy=gh.888853.xyz/gh-love
 
 this_script=$(realpath "$0")
 trap 'trap_err $LINENO $?' ERR
@@ -1018,8 +1018,8 @@ install_grub_win() {
         find /tmp/win32-loader -name 'g2ldr.mbr' -exec cp {} /cygdrive/$c/ \;
 
         # g2ldr
-        $grub-mkimage -p "$prefix" -O i386-pc -o core.img $grub_modules
-        cat $grub_dir/i386-pc/lnxboot.img core.img >/cygdrive/$c/g2ldr
+        $grub-mkimage -p "$prefix" -O i386-pc -o "$(cygpath -w $grub_dir/core.img)" $grub_modules
+        cat $grub_dir/i386-pc/lnxboot.img $grub_dir/core.img >/cygdrive/$c/g2ldr
 
         # 添加引导
         # 脚本可能不是首次运行，所以先删除原来的
@@ -1338,7 +1338,8 @@ esac
 # jsdelivr 有12小时缓存
 # https://github.com/XIU2/UserScript/blob/master/GithubEnhanced-High-Speed-Download.user.js#L31
 if [ -n "$github_proxy" ] && [[ "$confhome" = http*://raw.githubusercontent.com/* ]] && is_in_china; then
-    confhome=$github_proxy/$confhome
+    # confhome=$github_proxy/$confhome
+    confhome=${confhome/raw.githubusercontent.com/$github_proxy}
 fi
 
 # 以下目标系统不需要两步安装

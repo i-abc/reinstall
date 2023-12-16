@@ -1,7 +1,7 @@
 @echo off
 setlocal EnableDelayedExpansion
 set confhome=https://raw.githubusercontent.com/i-abc/reinstall/main
-set github_proxy=https://gh.888853.xyz/gh-love
+set github_proxy=gh.888853.xyz/gh-love
 
 :: Windows 7 SP1 winhttp 默认不支持 tls 1.2
 :: https://support.microsoft.com/en-us/topic/update-to-enable-tls-1-1-and-tls-1-2-as-default-secure-protocols-in-winhttp-in-windows-c4bd73d2-31d7-761e-0178-11268bb10392
@@ -35,7 +35,8 @@ if !errorlevel! == 0 (
     if defined github_proxy (
         echo !confhome! | findstr /c:"://raw.githubusercontent.com/" >nul
         if !errorlevel! == 0 (
-            set confhome=!github_proxy!/!confhome!
+            rem set confhome=!github_proxy!/!confhome!
+            set confhome=!confhome:raw.githubusercontent.com=%github_proxy%!
         )
     )
 ) else (
