@@ -3,7 +3,7 @@
 
 set -eE
 confhome=https://raw.githubusercontent.com/i-abc/reinstall/main
-github_proxy=gh.888853.xyz/gh-love
+github_proxy=https://gh.888853.xyz/gh-love
 
 this_script=$(realpath "$0")
 trap 'trap_err $LINENO $?' ERR
@@ -1338,8 +1338,8 @@ esac
 # jsdelivr 有12小时缓存
 # https://github.com/XIU2/UserScript/blob/master/GithubEnhanced-High-Speed-Download.user.js#L31
 if [ -n "$github_proxy" ] && [[ "$confhome" = http*://raw.githubusercontent.com/* ]] && is_in_china; then
-    # confhome=$github_proxy/$confhome
-    confhome=${confhome/raw.githubusercontent.com/$github_proxy}
+    confhome=$github_proxy/$confhome
+    # confhome=${confhome/raw.githubusercontent.com/$github_proxy}
 fi
 
 # 以下目标系统不需要两步安装
