@@ -55,7 +55,7 @@ add_community_repo() {
 
 # busybox 的 wget 没有重试功能
 wget() {
-    for i in 1 2 3; do
+    for i in $(seq 5); do
         command wget "$@" && return
     done
 }
@@ -67,7 +67,6 @@ is_have_cmd() {
 download() {
     url=$1
     path=$2
-    echo $url
 
     # 有ipv4地址无ipv4网关的情况下，aria2可能会用ipv4下载，而不是ipv6
     # axel 在 lightsail 上会占用大量cpu
@@ -96,19 +95,35 @@ download() {
 
     # 阿里云源检测 user-agent 禁止 axel/aria2 下载
     # aria2 默认 --max-tries 5
-    stdbuf -o0 -e0 \
-        aria2c -x4 \
-        --allow-overwrite=true \
-        --summary-interval=0 \
-        --user-agent=Wget/1.21.1 \
-        $save $url
+
+    # 默认 --max-tries=5，但以下情况服务器出错，aria2不会重试，而是直接返回错误
+    # 因此添加 for 循环
+    #     [ERROR] CUID#7 - Download aborted. URI=https://aka.ms/manawindowsdrivers
+    # Exception: [AbstractCommand.cc:351] errorCode=1 URI=https://aka.ms/manawindowsdrivers
+    #   -> [SocketCore.cc:1019] errorCode=1 SSL/TLS handshake failure:  `not signed by known authorities or invalid'
+
+    # 用 if 的话，报错不会中断脚本
+    # if aria2c xxx; then
+    #     return
+    # fi
+
+    echo "$url"
+    for i in $(seq 5); do
+        stdbuf -oL -eL \
+            aria2c -x4 \
+            --allow-overwrite=true \
+            --summary-interval=0 \
+            --user-agent=Wget/1.21.1 \
+            --max-tries 1 \
+            $save $url && return
+    done
 }
 
 update_part() {
     sleep 1
 
     # 玄学
-    for i in 1 2 3; do
+    for i in $(seq 3); do
         sync
         partprobe /dev/$xda 2>/dev/null
 
@@ -195,18 +210,44 @@ get_ttys() {
     wget $confhome/ttys.sh -O- | sh -s $prefix
 }
 
-get_xda() {
-    # 排除只读盘，vda 放前面
-    # 有的机器有sda和vda，vda是主硬盘，另一个盘是只读
-    # TODO: 找出容量最大的？
-    for _xda in vda xda sda hda xvda nvme0n1; do
-        if [ -e "/sys/class/block/$_xda/ro" ] &&
-            [ "$(cat /sys/class/block/$_xda/ro)" = 0 ]; then
-            echo $_xda
-            return
+find_xda() {
+    # 防止 $main_disk 为空
+    if [ -z "$main_disk" ]; then
+        error_and_exit "cmdline main_disk is empty."
+    fi
+
+    # busybox fdisk 不显示 mbr 分区表 id
+    # fdisk 在 util-linux-misc 里面，占用大
+    # sfdisk 占用小
+
+    apk add sfdisk
+
+    for disk in $(get_all_disks); do
+        if sfdisk --disk-id "/dev/$disk" | sed 's/0x//' | grep -ix "$main_disk"; then
+            xda=$disk
+            break
         fi
     done
-    return 1
+
+    if [ -z "$xda" ]; then
+        error_and_exit "Could not find xda: $main_disk"
+    fi
+
+    apk del sfdisk
+}
+
+get_all_disks() {
+    # busybox blkid 不接受任何参数
+    # lsblk 要另外安装
+    disks=$(blkid | cut -d: -f1 | cut -d/ -f3 | sed -E 's/p?[0-9]+$//' | sort -u)
+
+    # blkid 会显示 sr0，经过上面的命令输出为 sr
+    # 因此要检测是否有效
+    for disk in $disks; do
+        if [ -b "/dev/$disk" ]; then
+            echo "$disk"
+        fi
+    done
 }
 
 setup_tty_and_log() {
@@ -227,11 +268,6 @@ extract_env_from_cmdline() {
             fi
         done < <(xargs -n1 </proc/cmdline | grep "^$prefix" | sed "s/^$prefix\.//")
     done
-}
-
-qemu_nbd() {
-    command qemu-nbd "$@"
-    sleep 5
 }
 
 mod_motd() {
@@ -265,7 +301,7 @@ umount_all() {
 
 # 可能脚本不是首次运行，先清理之前的残留
 clear_previous() {
-    qemu_nbd -d /dev/nbd0 2>/dev/null || true
+    qemu-nbd -d /dev/nbd0 2>/dev/null || true
     swapoff -a
     umount_all
 
@@ -436,6 +472,75 @@ to_upper() {
 
 to_lower() {
     tr '[:upper:]' '[:lower:]'
+}
+
+del_empty_lines() {
+    # grep .
+    sed '/^[[:space:]]*$/d'
+}
+
+get_part_num_by_part() {
+    dev_part=$1
+    echo "$dev_part" | grep -o '[0-9]*' | tail -1
+}
+
+get_fallback_efi_file_name() {
+    case $(arch) in
+    x86_64) echo bootx64.efi ;;
+    aarch64) echo bootaa64.efi ;;
+    *) error_and_exit ;;
+    esac
+}
+
+del_invalid_efi_entry() {
+    apk add lsblk efibootmgr
+
+    efibootmgr --quiet --remove-dups
+
+    while read -r line; do
+        part_uuid=$(echo "$line" | awk -F ',' '{print $3}')
+        efi_index=$(echo "$line" | grep_efi_index)
+        if ! lsblk -o PARTUUID | grep -q "$part_uuid"; then
+            echo "Delete invalid EFI Entry: $line"
+            efibootmgr --quiet --bootnum "$efi_index" --delete-bootnum
+        fi
+    done < <(efibootmgr | grep 'HD(.*,GPT,')
+}
+
+grep_efi_index() {
+    awk -F '*' '{print $1}' | sed 's/Boot//'
+}
+
+# 某些机器可能不会回落到 bootx64.efi
+# 因此手动添加一个回落项
+add_fallback_efi_to_nvram() {
+    apk add lsblk efibootmgr
+
+    EFI_UUID=C12A7328-F81F-11D2-BA4B-00A0C93EC93B
+    efi_row=$(lsblk /dev/$xda -ro NAME,PARTTYPE,PARTUUID | grep -i "$EFI_UUID")
+    efi_part_uuid=$(echo "$efi_row" | awk '{print $3}')
+    efi_part_name=$(echo "$efi_row" | awk '{print $1}')
+    efi_part_num=$(get_part_num_by_part "$efi_part_name")
+    efi_file=$(get_fallback_efi_file_name)
+
+    # 创建条目，先判断是否已经存在
+    if ! efibootmgr | grep -i "HD($efi_part_num,GPT,$efi_part_uuid,.*)/File(\\\EFI\\\boot\\\\$efi_file)"; then
+        fallback_id=$(efibootmgr --create-only \
+            --disk "/dev/$xda" \
+            --part "$efi_part_num" \
+            --label "fallback" \
+            --loader "\\EFI\\boot\\$efi_file" |
+            tail -1 | grep_efi_index)
+
+        # 添加到最后
+        orig_order=$(efibootmgr | grep -F BootOrder: | awk '{print $2}')
+        if [ -n "$orig_order" ]; then
+            new_order="$orig_order,$fallback_id"
+        else
+            new_order="$fallback_id"
+        fi
+        efibootmgr --bootorder "$new_order"
+    fi
 }
 
 unix2dos() {
@@ -660,6 +765,13 @@ EOF
         fi
     fi
 
+    # setup-disk 安装 grub 跳过了添加引导项到 nvram
+    # 防止部分机器不会 fallback 到 bootx64.efi
+    if is_efi; then
+        apk add efibootmgr
+        sed -i 's/--no-nvram//' /sbin/setup-disk
+    fi
+
     # 安装到硬盘
     # alpine默认使用 syslinux (efi 环境除外)，这里强制使用 grub，方便用脚本再次重装
     KERNELOPTS="$(get_ttys console=)"
@@ -670,6 +782,11 @@ EOF
     # 3.19 或以上，非 efi 需要手动安装 grub
     if ! is_efi && grep -F '3.19' /etc/alpine-release; then
         grub-install --boot-directory=/os/boot --target=i386-pc /dev/$xda
+    fi
+
+    # 删除无效的 efi 条目
+    if is_efi; then
+        del_invalid_efi_entry
     fi
 
     # 是否保留 swap
@@ -713,11 +830,38 @@ dd_gzip_xz() {
     # alpine busybox 自带 gzip xz，但官方版也许性能更好
     # 用官方 wget，一来带进度条，二来自带重试
     apk add wget $prog
-    command wget $img -O- --tries=3 --progress=bar:force | $prog -dc >/dev/$xda
+    if ! command wget $img -O- --tries=5 --progress=bar:force | $prog -dc >/dev/$xda 2>/tmp/dd_stderr; then
+        # vhd 文件结尾有 512 字节额外信息，可以忽略
+        if grep -iq 'No space' /tmp/dd_stderr; then
+            apk add parted
+            disk_size=$(get_xda_size)
+            disk_end=$((disk_size - 1))
+            # 这里要 Ignore 两次
+            # Error: Can't have a partition outside the disk!
+            # Ignore/Cancel? i
+            # Error: Can't have a partition outside the disk!
+            # Ignore/Cancel? i
+            last_part_end=$(yes i | parted /dev/$xda 'unit b print' ---pretend-input-tty |
+                del_empty_lines | tail -1 | awk '{print $3}' | sed 's/B//')
+
+            echo "Last part end: $last_part_end"
+            echo "Disk end:      $disk_end"
+
+            if [ "$last_part_end" -le "$disk_end" ]; then
+                echo "Safely ignore no space error."
+                return
+            fi
+        fi
+        error_and_exit "$(cat /tmp/dd_stderr)"
+    fi
+}
+
+get_xda_size() {
+    blockdev --getsize64 /dev/$xda
 }
 
 is_xda_gt_2t() {
-    disk_size=$(blockdev --getsize64 /dev/$xda)
+    disk_size=$(get_xda_size)
     disk_2t=$((2 * 1024 * 1024 * 1024 * 1024))
     [ "$disk_size" -gt "$disk_2t" ]
 }
@@ -748,7 +892,7 @@ create_part() {
         # 按iso容量计算分区大小，200m用于驱动和文件系统自身占用
         part_size="$((size_bytes / 1024 / 1024 + 200))MiB"
 
-        apk add ntfs-3g-progs virt-what wimlib rsync
+        apk add ntfs-3g-progs
         # 虽然ntfs3不需要fuse，但wimmount需要，所以还是要保留
         modprobe fuse ntfs3
         if is_efi; then
@@ -769,11 +913,12 @@ create_part() {
             mkfs.ext4 -F -L os /dev/$xda*3           #3 os
             mkfs.ntfs -f -F -L installer /dev/$xda*4 #4 installer
         else
-            # bios
+            # bios + mbr 启动盘最大可用 2t
+            is_xda_gt_2t && max_usable_size=2TiB || max_usable_size=100%
             parted /dev/$xda -s -- \
                 mklabel msdos \
                 mkpart primary ntfs 1MiB -${part_size} \
-                mkpart primary ntfs -${part_size} 100% \
+                mkpart primary ntfs -${part_size} ${max_usable_size} \
                 set 1 boot on
             update_part /dev/$xda
 
@@ -809,9 +954,8 @@ create_part() {
                 mkfs.ext4 -F -L installer /dev/$xda*3 #3 installer
             fi
         else
-            # 最大的 qcow2 是 centos8，1.8g
-            # gentoo 的镜像解压后是 3.5g，因此设置 installer 分区 1g，这样才能在5g硬盘上安装
-            [ "$distro" = gentoo ] && installer_part_size=1GiB || installer_part_size=2GiB
+            # fedora debian ubuntu opensuse arch gentoo
+            installer_part_size=1GiB
             parted /dev/$xda -s -- \
                 mklabel gpt \
                 mkpart '" "' ext4 1MiB -$installer_part_size \
@@ -1176,7 +1320,7 @@ modify_linux() {
     # 修复 fedora 38 或以下用静态 ipv6 会掉线
     # el 全系也用 NetworkManager，但他们的配置文件是 sysconfig，因此不受影响
     # https://github.com/canonical/cloud-init/commit/5d440856cb6d2b4c908015fe4eb7227615c17c8b
-    if grep -E 'fedora:(37|38)' $os_dir/etc/os-release; then
+    if grep -E 'fedora:38' $os_dir/etc/os-release; then
         network_manager_py=$os_dir/usr/lib/python3.11/site-packages/cloudinit/net/network_manager.py &&
             if ! grep '"static6": "manual",' $network_manager_py; then
                 echo '"static6": "manual",' | insert_into_file $network_manager_py after '"static": "manual",'
@@ -1213,12 +1357,20 @@ EOF
         fi
     fi
 
-    # opensuse tumbleweed 需安装 wicked
+    # opensuse tumbleweed
+    # TODO: cloud-init 更新后删除
     if grep opensuse-tumbleweed $os_dir/etc/os-release; then
-        cp -f /etc/resolv.conf $os_dir/etc/resolv.conf
+        touch $os_dir/etc/NetworkManager/NetworkManager.conf
+    fi
+
+    # arch
+    if [ -f $os_dir/etc/arch-release ]; then
+        rm $os_dir/etc/resolv.conf
+        cp /etc/resolv.conf $os_dir/etc/resolv.conf
         mount_pseudo_fs $os_dir
-        chroot $os_dir zypper install -y wicked
-        rm -f $os_dir/etc/resolv.conf
+        chroot $os_dir pacman-key --init
+        chroot $os_dir pacman-key --populate
+        rm $os_dir/etc/resolv.conf
     fi
 
     # gentoo
@@ -1289,7 +1441,11 @@ modify_os_on_disk() {
                     return
                 fi
             elif [ "$only_process" = windows ]; then
-                # find 有时会报 I/O error
+                # find 不是很聪明
+                # find /mnt/c -iname windows -type d -maxdepth 1
+                # find: /mnt/c/pagefile.sys: Permission denied
+                # find: /mnt/c/swapfile.sys: Permission denied
+                # shellcheck disable=SC2010
                 if ls -d /os/*/ | grep -i '/windows/' 2>/dev/null; then
                     # 重新挂载为读写、忽略大小写
                     umount /os
@@ -1375,7 +1531,7 @@ install_qcow_el() {
     }
 
     modprobe nbd nbds_max=1
-    qemu_nbd -c /dev/nbd0 $qcow_file
+    qemu-nbd -c /dev/nbd0 $qcow_file
 
     # TODO: 改成循环mount找出os+fstab查找剩余分区？
     os_part=$(lsblk /dev/nbd0p*[0-9] --sort SIZE -no NAME,FSTYPE | grep xfs | tail -1 | cut -d' ' -f1)
@@ -1426,7 +1582,7 @@ install_qcow_el() {
 
     # 取消挂载 nbd
     umount /nbd/ /nbd-boot/ /nbd-efi/ || true
-    qemu_nbd -d /dev/nbd0
+    qemu-nbd -d /dev/nbd0
 
     # 如果镜像有efi分区，复制其uuid
     # 如果有相同uuid的fat分区，则无法挂载
@@ -1551,7 +1707,7 @@ EOF
 dd_qcow() {
     if true; then
         modprobe nbd nbds_max=1
-        qemu_nbd -c /dev/nbd0 $qcow_file
+        qemu-nbd -c /dev/nbd0 $qcow_file
 
         # 检查最后一个分区是否是 btrfs
         # 即使awk结果为空，返回值也是0，加上 grep . 检查是否结果为空
@@ -1581,11 +1737,11 @@ dd_qcow() {
                 printf "yes" | parted /dev/nbd0 resizepart $part_num ${part_end}B ---pretend-input-tty
 
                 # 缩小 qcow2
-                qemu_nbd -d /dev/nbd0
+                qemu-nbd -d /dev/nbd0
                 qemu-img resize --shrink $qcow_file $part_end
 
                 # 重新连接
-                qemu_nbd -c /dev/nbd0 $qcow_file
+                qemu-nbd -c /dev/nbd0 $qcow_file
             else
                 umount /mnt/btrfs
             fi
@@ -1617,12 +1773,19 @@ dd_qcow() {
             ;;
         esac
 
-        qemu_nbd -d /dev/nbd0
+        qemu-nbd -d /dev/nbd0
     else
         # 将前1M dd到内存，将1M之后 dd到硬盘
         qemu-img dd if=$qcow_file of=/first-1M bs=1M count=1
         qemu-img dd if=$qcow_file of=/dev/disk/by-label/os bs=1M skip=1
     fi
+
+    # 需要等待一下，不然会出现
+    # umount: /installer/: target is busy.
+    while fuser -sm /installer/; do
+        echo "Waiting for /installer/ to be unmounted..."
+        sleep 5
+    done
 
     # 将前1M从内存 dd 到硬盘
     umount /installer/
@@ -1727,6 +1890,8 @@ EOF
 }
 
 install_windows() {
+    apk add wimlib virt-what dmidecode pev
+
     # shellcheck disable=SC2154
     download $iso /os/windows.iso
     mkdir -p /iso
@@ -1740,10 +1905,19 @@ install_windows() {
         cp -rv /iso/boot* /os/boot/efi/
         cp -rv /iso/efi/ /os/boot/efi/
         cp -rv /iso/sources/boot.wim /os/boot/efi/sources/
-        rsync -rv --exclude=/sources/boot.wim /iso/* /os/installer/
+
+        if false; then
+            rsync -rv --exclude=/sources/boot.wim /iso/* /os/installer/
+        else
+            cd /iso
+            echo 'Copying installer files...'
+            find . -type f -not -name boot.wim -exec cp -r --parents {} /os/installer/ \;
+            cd -
+        fi
         boot_wim=/os/boot/efi/sources/boot.wim
     else
-        rsync -rv /iso/* /os/installer/
+        echo 'Copying installer files...'
+        cp -r /iso/* /os/installer/
         boot_wim=/os/installer/sources/boot.wim
     fi
 
@@ -1764,17 +1938,15 @@ install_windows() {
         # 否则改成正确的大小写
         image_name=$(wiminfo $install_wim | grep -ix "Name:[[:blank:]]*$image_name" | cut -d: -f2 | xargs)
     fi
+    echo "Image Name: $image_name"
 
-    is_win7_or_win2008r2() {
-        echo $image_name | grep -iEw '^Windows (7|Server 2008 R2)'
-    }
-
-    is_win11() {
-        echo $image_name | grep -iEw '^Windows 11'
-    }
+    # 用内核版本号筛选驱动
+    # 使得可以安装 Hyper-V Server / Azure Stack HCI 等 Windows Server 变种
+    nt_ver="$(peres -v /iso/setup.exe | grep 'Product Version:' | cut -d: -f2 | xargs | cut -d. -f 1,2)"
+    echo "NT Version: $nt_ver"
 
     # 跳过 win11 硬件限制
-    if is_win11; then
+    if [[ "$image_name" = "Windows 11"* ]]; then
         wiminfo "$install_wim" "$image_name" --image-property WINDOWS/INSTALLATIONTYPE=Server
     fi
 
@@ -1819,14 +1991,30 @@ install_windows() {
         [ "$arch_wim" = x86_64 ]; then
         # aws nitro
         # 只有 x64 位驱动
-        # https://docs.aws.amazon.com/zh_cn/AWSEC2/latest/WindowsGuide/migrating-latest-types.html
-        if is_win7_or_win2008r2; then
-            download https://s3.amazonaws.com/ec2-windows-drivers-downloads/NVMe/1.3.2/AWSNVMe.zip $drv/AWSNVMe.zip
-            download https://s3.amazonaws.com/ec2-windows-drivers-downloads/ENA/x64/2.2.3/AwsEnaNetworkDriver.zip $drv/AwsEnaNetworkDriver.zip
-        else
-            download https://s3.amazonaws.com/ec2-windows-drivers-downloads/NVMe/Latest/AWSNVMe.zip $drv/AWSNVMe.zip
-            download https://s3.amazonaws.com/ec2-windows-drivers-downloads/ENA/Latest/AwsEnaNetworkDriver.zip $drv/AwsEnaNetworkDriver.zip
-        fi
+        # 可能不支持 vista
+        # 未打补丁的 win7 无法使用 sha256 签名的驱动
+        # https://docs.aws.amazon.com/zh_cn/AWSEC2/latest/WindowsGuide/aws-nvme-drivers.html
+        # https://docs.aws.amazon.com/zh_cn/AWSEC2/latest/WindowsGuide/enhanced-networking-ena.html
+
+        nvme_ver=$(
+            case "$nt_ver" in
+            6.0 | 6.1) echo 1.3.2 ;; # sha1 签名
+            *) echo Latest ;;
+            esac
+        )
+
+        ena_ver=$(
+            case "$nt_ver" in
+            6.0 | 6.1) echo 2.1.4 ;; # sha1 签名
+            # 6.0 | 6.1) echo 2.2.3 ;; # sha256 签名
+            6.2 | 6.3) echo 2.6.0 ;;
+            *) echo Latest ;;
+            esac
+        )
+
+        download https://s3.amazonaws.com/ec2-windows-drivers-downloads/NVMe/$nvme_ver/AWSNVMe.zip $drv/AWSNVMe.zip
+        download https://s3.amazonaws.com/ec2-windows-drivers-downloads/ENA/$ena_ver/AwsEnaNetworkDriver.zip $drv/AwsEnaNetworkDriver.zip
+
         unzip -o -d $drv/aws/ $drv/AWSNVMe.zip
         unzip -o -d $drv/aws/ $drv/AwsEnaNetworkDriver.zip
 
@@ -1834,15 +2022,19 @@ install_windows() {
         [ "$arch_wim" = x86_64 ]; then
         # aws xen
         # 只有 64 位驱动
-        # 未测试
-        # https://docs.aws.amazon.com/zh_cn/AWSEC2/latest/WindowsGuide/Upgrading_PV_drivers.html
+        # 可能不支持 vista
+        # https://docs.aws.amazon.com/zh_cn/AWSEC2/latest/WindowsGuide/xen-drivers-overview.html
         apk add msitools
 
-        if is_win7_or_win2008r2; then
-            download https://s3.amazonaws.com/ec2-windows-drivers-downloads/AWSPV/8.3.5/AWSPVDriver.zip $drv/AWSPVDriver.zip
-        else
-            download https://s3.amazonaws.com/ec2-windows-drivers-downloads/AWSPV/Latest/AWSPVDriver.zip $drv/AWSPVDriver.zip
-        fi
+        aws_pv_ver=$(
+            case "$nt_ver" in
+            6.0 | 6.1) echo 8.3.2 ;; # sha1 签名
+            # 6.0 | 6.1) echo 8.3.5 ;; # sha256 签名
+            *) echo Latest ;;
+            esac
+        )
+
+        download https://s3.amazonaws.com/ec2-windows-drivers-downloads/AWSPV/$aws_pv_ver/AWSPVDriver.zip $drv/AWSPVDriver.zip
 
         unzip -o -d $drv $drv/AWSPVDriver.zip
         msiextract $drv/AWSPVDriverSetup.msi -C $drv
@@ -1869,27 +2061,21 @@ install_windows() {
         # virtio
         # x86 x64 arm64 都有
         # https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/
-        case $(echo "$image_name" | to_lower) in
-        'windows server 2022'*) sys=2k22 ;;
-        'windows server 2019'*) sys=2k19 ;;
-        'windows server 2016'*) sys=2k16 ;;
-        'windows server 2012 R2'*) sys=2k12R2 ;;
-        'windows server 2012'*) sys=2k12 ;;
-        'windows server 2008 R2'*) sys=2k8R2 ;;
-        'windows server 2008'*) sys=2k8 ;;
-        'windows 11'*) sys=w11 ;;
-        'windows 10'*) sys=w10 ;;
-        'windows 8.1'*) sys=w8.1 ;;
-        'windows 8'*) sys=w8 ;;
-        'windows 7'*) sys=w7 ;;
-        'windows vista'*) sys=2k8 ;; # virtio 没有 vista 专用驱动
+
+        # 没有 vista 文件夹
+        case "$nt_ver" in
+        6.0) sys=2k8 ;;
+        6.1) sys=w7 ;;
+        6.2) sys=w8 ;;
+        6.3) sys=w8.1 ;;
+        10.0) sys=w10 ;;
         esac
 
-        case "$sys" in
         # https://github.com/virtio-win/virtio-win-pkg-scripts/issues/40
-        w7) dir=archive-virtio/virtio-win-0.1.173-9 ;;
         # https://github.com/virtio-win/virtio-win-pkg-scripts/issues/61
-        2k12*) dir=archive-virtio/virtio-win-0.1.215-1 ;;
+        case "$nt_ver" in
+        6.0 | 6.1) dir=archive-virtio/virtio-win-0.1.173-9 ;; # vista | w7 | 2k8 | 2k8R2
+        6.2 | 6.3) dir=archive-virtio/virtio-win-0.1.215-1 ;; # win8 | w8.1 | 2k12 | 2k12R2
         *) dir=stable-virtio ;;
         esac
 
@@ -1910,78 +2096,47 @@ install_windows() {
                 wget $gce_repo$link -O- | tar -xzf- -C $drv/gce/$name
             done
 
-            # 没有 vista 驱动
-            # 没有专用的 win11 驱动
-            case $(echo "$image_name" | to_lower) in
-            'windows server 2022'*) sys_gce=win10.0 ;;
-            'windows server 2019'*) sys_gce=win10.0 ;;
-            'windows server 2016'*) sys_gce=win10.0 ;;
-            'windows server 2012 R2'*) sys_gce=win6.3 ;;
-            'windows server 2012'*) sys_gce=win6.2 ;;
-            'windows server 2008 R2'*) sys_gce=win6.1 ;;
-            'windows 11'*) sys_gce=win10.0 ;;
-            'windows 10'*) sys_gce=win10.0 ;;
-            'windows 8.1'*) sys_gce=win6.3 ;;
-            'windows 8'*) sys_gce=win6.2 ;;
-            'windows 7'*) sys_gce=win6.1 ;;
-            esac
+            # 没有 win6.0 文件夹
+            sys_gce=win$nt_ver
         fi
+
+    elif [ "$(dmidecode -s chassis-asset-tag)" = "7783-7084-3265-9085-8269-3286-77" ] &&
+        [ "$arch_wim" != arm64 ]; then
+        # azure
+        # 有 x86 x64，没 arm64
+        # https://learn.microsoft.com/azure/virtual-network/accelerated-networking-mana-windows
+        download https://aka.ms/manawindowsdrivers $drv/azure.zip
+        unzip $drv/azure.zip -d $drv/azure/
     fi
 
     # 修改应答文件
-    download $confhome/windows.xml /tmp/Autounattend.xml
+    download $confhome/windows.xml /tmp/autounattend.xml
     locale=$(wiminfo $install_wim | grep 'Default Language' | head -1 | awk '{print $NF}')
-    sed -i "s|%arch%|$arch|; s|%image_name%|$image_name|; s|%locale%|$locale|" /tmp/Autounattend.xml
-
-    # 修改 disk_id
-    if false; then
-        # sda 只读，放的是 cloud-init 配置，通常 win 有驱动，能识别
-        # 而 vda/nvme/xen 加载驱动后才能识别，所以这时 disk_id 应该为 1
-        if [ -e "/sys/class/block/sda/ro" ] &&
-            [ "$(cat /sys/class/block/sda/ro)" = 1 ]; then
-            disk_id=1
-        else
-            disk_id=0
-        fi
-        sed -i "s|%disk_id%|$disk_id|" /tmp/Autounattend.xml
-    fi
+    sed -i "s|%arch%|$arch|; s|%image_name%|$image_name|; s|%locale%|$locale|" /tmp/autounattend.xml
 
     # 修改应答文件，分区配置
     if is_efi; then
-        sed -i "s|%installto_partitionid%|3|" /tmp/Autounattend.xml
-        insert_into_file /tmp/Autounattend.xml after '<ModifyPartitions>' <<EOF
-            <ModifyPartition wcm:action="add">
-                <Order>1</Order>
-                <PartitionID>1</PartitionID>
-                <Format>FAT32</Format>
-            </ModifyPartition>
-            <ModifyPartition wcm:action="add">
-                <Order>2</Order>
-                <PartitionID>2</PartitionID>
-            </ModifyPartition>
-            <ModifyPartition wcm:action="add">
-                <Order>3</Order>
-                <PartitionID>3</PartitionID>
-                <Format>NTFS</Format>
-            </ModifyPartition>
-EOF
+        sed -i "s|%installto_partitionid%|3|" /tmp/autounattend.xml
     else
-        sed -i "s|%installto_partitionid%|1|" /tmp/Autounattend.xml
-        insert_into_file /tmp/Autounattend.xml after '<ModifyPartitions>' <<EOF
-            <ModifyPartition wcm:action="add">
-                <Order>1</Order>
-                <PartitionID>1</PartitionID>
-                <Format>NTFS</Format>
-            </ModifyPartition>
-EOF
+        sed -i "s|%installto_partitionid%|1|" /tmp/autounattend.xml
     fi
 
-    #     # ei.cfg
-    #     cat <<EOF >/os/installer/sources/ei.cfg
-    #         [Channel]
-    #         OEM
-    # EOF
-    #     unix2dos /os/installer/sources/ei.cfg
+    # shellcheck disable=SC2010
+    if ei_cfg="$(ls -d /os/installer/sources/* | grep -i ei.cfg)" &&
+        grep -i EVAL "$ei_cfg"; then
+        # 评估版 iso 需要删除 autounattend.xml 里面的 <Key><Key/>
+        # 否则会出现 Windows Cannot find Microsoft software license terms
+        sed -i "/%key%/d" /tmp/autounattend.xml
+    else
+        # vista 需密钥，密钥可与 edition 不一致
+        # 其他系统要空密钥
+        if [[ "$image_name" = 'Windows Vista'* ]]; then
+            key=VKK3X-68KWM-X2YGT-QR4M6-4BWMV
+        else
+            key=
+        fi
+        sed -i "s/%key%/$key/" /tmp/autounattend.xml
+    fi
 
     # 挂载 boot.wim
     mkdir -p /wim
@@ -1989,28 +2144,33 @@ EOF
 
     cp_drivers() {
         src=$1
-        path=$2
+        shift
 
-        [ -n "$path" ] && filter="-ipath $path" || filter=""
         find $src \
-            $filter \
             -type f \
             -not -iname "*.pdb" \
             -not -iname "dpinst.exe" \
+            "$@" \
             -exec cp -rfv {} /wim/drivers \;
     }
 
     # 添加驱动
     mkdir -p /wim/drivers
-
-    [ -d $drv/virtio ] && cp_drivers $drv/virtio "*/$sys/$arch/*"
+    [ -d $drv/virtio ] && {
+        if [ "$nt_ver" = 6.0 ]; then
+            # 气球驱动有问题
+            cp_drivers $drv/virtio -ipath "*/$sys/$arch/*" -not -ipath "*/balloon/*"
+        else
+            cp_drivers $drv/virtio -ipath "*/$sys/$arch/*"
+        fi
+    }
     [ -d $drv/aws ] && cp_drivers $drv/aws
-    [ -d $drv/xen ] && cp_drivers $drv/xen "*/$arch_xen/*"
+    [ -d $drv/xen ] && cp_drivers $drv/xen -ipath "*/$arch_xen/*"
+    [ -d $drv/azure ] && cp_drivers $drv/azure
     [ -d $drv/gce ] && {
         [ "$arch_wim" = x86 ] && gvnic_suffix=-32 || gvnic_suffix=
-        cp_drivers $drv/gce/gvnic "*/$sys_gce$gvnic_suffix/*"
-        # gga 驱动不分32/64位
-        cp_drivers $drv/gce/gga "*/$sys_gce/*"
+        cp_drivers $drv/gce/gvnic -ipath "*/$sys_gce$gvnic_suffix/*"
+        cp_drivers $drv/gce/gga -ipath "*/$sys_gce/*"
     }
 
     # win7 要添加 bootx64.efi 到 efi 目录
@@ -2021,10 +2181,10 @@ EOF
     fi
 
     # 复制应答文件
-    # 移除注释，否则 windows-setup.bat 重新生成的 Autounattend.xml 有问题
+    # 移除注释，否则 windows-setup.bat 重新生成的 autounattend.xml 有问题
     apk add xmlstarlet
-    xmlstarlet ed -d '//comment()' /tmp/Autounattend.xml >/wim/Autounattend.xml
-    unix2dos /wim/Autounattend.xml
+    xmlstarlet ed -d '//comment()' /tmp/autounattend.xml >/wim/autounattend.xml
+    unix2dos /wim/autounattend.xml
 
     # 复制安装脚本
     # https://slightlyovercomplicated.com/2016/11/07/windows-pe-startup-sequence-explained/
@@ -2033,7 +2193,8 @@ EOF
     # 如果有重复的 Windows/System32 文件夹，会提示找不到 winload.exe 无法引导
     # win7 win10 是 Windows/System32
     # win2016    是 windows/system32
-    system32_dir=$(ls -d /wim/*/*32)
+    # shellcheck disable=SC2010
+    system32_dir=$(ls -d /wim/*/*32 | grep -i windows/system32)
     download $confhome/windows-setup.bat $system32_dir/startnet.cmd
 
     # 提交修改 boot.wim
@@ -2046,7 +2207,7 @@ EOF
     if [[ "$install_wim" = '*.wim' ]]; then
         wimmountrw $install_wim "$image_name" /wim/
         if false; then
-            # 使用 Autounattend.xml
+            # 使用 autounattend.xml
             # win7 在此阶段找不到网卡
             download $confhome/windows-resize.bat /wim/windows-resize.bat
             create_win_set_netconf_script /wim/windows-set-netconf.bat
@@ -2086,6 +2247,12 @@ download_netboot_xyz_efi() {
     fi
 }
 
+refind_main_disk() {
+    apk add sfdisk
+    main_disk="$(sfdisk --disk-id "/dev/$xda" | sed 's/0x//')"
+    apk del sfdisk
+}
+
 install_redhat_ubuntu() {
     # 安装 grub2
     if is_efi; then
@@ -2099,8 +2266,15 @@ install_redhat_ubuntu() {
     fi
 
     # 重新整理 extra，因为grub会处理掉引号，要重新添加引号
+    extra_cmdline=''
     for var in $(grep -o '\bextra\.[^ ]*' /proc/cmdline | xargs); do
-        extra_cmdline="$extra_cmdline $(echo $var | sed -E "s/(extra\.[^=]*)=(.*)/\1='\2'/")"
+        if [[ "$var" = "extra.main_disk="* ]]; then
+            # 重新记录主硬盘
+            refind_main_disk
+            extra_cmdline="$extra_cmdline extra.main_disk=$main_disk"
+        else
+            extra_cmdline="$extra_cmdline $(echo $var | sed -E "s/(extra\.[^=]*)=(.*)/\1='\2'/")"
+        fi
     done
 
     # 安装红帽系时，只有最后一个有安装界面显示
@@ -2159,6 +2333,8 @@ EOF
         }
 EOF
     fi
+
+    cat "$grub_cfg"
 }
 
 # 脚本入口
@@ -2182,8 +2358,8 @@ cat /proc/cmdline
 clear_previous
 add_community_repo
 
-# 找到主硬盘
-xda=$(get_xda)
+# 需要在重新分区之前，找到主硬盘
+find_xda
 
 if [ "$distro" != "alpine" ]; then
     setup_nginx_if_enough_ram
@@ -2230,14 +2406,17 @@ else
     fi
 fi
 
+# alpine 因内存容量问题，单独处理
+if is_efi && [ "$distro" != "alpine" ]; then
+    del_invalid_efi_entry
+    add_fallback_efi_to_nvram
+fi
+
 echo 'done'
 if [ "$hold" = 2 ]; then
     exit
 fi
 
-# 让 web ssh 输出全部内容
-for i in $(seq 10); do
-    echo
-done
+# 让 web 输出全部内容
 sleep 5
 reboot

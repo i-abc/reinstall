@@ -8,8 +8,14 @@ ipv6_addr=$4
 ipv6_gateway=$5
 is_in_china=$6
 
+# 3.16-3.18 $device
+# 3.19.1+ $iface
 # shellcheck disable=SC2154
-ethx="$device"
+if [ -n "$iface" ]; then
+    ethx="$iface"
+else
+    ethx="$device"
+fi
 
 if $is_in_china; then
     ipv4_dns1='119.29.29.29'
@@ -115,20 +121,18 @@ test_internet() {
     echo 'Testing Internet Connection...'
 
     for i in $(seq 5); do
-        {
-            if is_need_test_ipv4 && nslookup www.qq.com $ipv4_dns1; then
-                echo "IPv4 has internet."
-                ipv4_has_internet=true
-            fi
-            if is_need_test_ipv6 && nslookup www.qq.com $ipv6_dns1; then
-                echo "IPv6 has internet."
-                ipv6_has_internet=true
-            fi
-            if ! is_need_test_ipv4 && ! is_need_test_ipv6; then
-                break
-            fi
-            sleep 1
-        } >/dev/null 2>&1
+        if is_need_test_ipv4 && nslookup www.qq.com $ipv4_dns1 2>/dev/null; then
+            echo "IPv4 has internet."
+            ipv4_has_internet=true
+        fi
+        if is_need_test_ipv6 && nslookup www.qq.com $ipv6_dns1 2>/dev/null; then
+            echo "IPv6 has internet."
+            ipv6_has_internet=true
+        fi
+        if ! is_need_test_ipv4 && ! is_need_test_ipv6; then
+            break
+        fi
+        sleep 1
     done
 }
 

@@ -16,10 +16,9 @@ chpasswd:
       password: $6$0esRbIJ4LM5uA.CL$HD.A0m2f6lFwVVCcgu.7TZsWnuVeffSY3jrBz2tQEQaeQQvqfeBS7t4sefKIWCSpONXYBPMLgYTvMuzAB93Bl.
       type: sha-512
 runcmd:
-  # arch 没有 /etc/ssh/sshd_config.d/ 文件夹
-  # opensuse tumbleweed 有 /etc/ssh/sshd_config.d/ 文件夹，但没有 /etc/ssh/sshd_config，但有/usr/etc/ssh/sshd_config
+  # opensuse tumbleweed 有 /etc/ssh/sshd_config.d/ 文件夹，没有 /etc/ssh/sshd_config，有/usr/etc/ssh/sshd_config
   - grep 'Include.*/etc/ssh/sshd_config.d' /etc/ssh/sshd_config && mkdir -p /etc/ssh/sshd_config.d && echo "PermitRootLogin yes" >/etc/ssh/sshd_config.d/01-permitrootlogin.conf || echo "PermitRootLogin yes" >>/etc/ssh/sshd_config
   - systemctl restart sshd
   - touch /etc/cloud/cloud-init.disabled
   # ubuntu 镜像运行 echo -e '\nDone' ，-e 会被显示出来
-  - printf '\n%s\n' 'done' >/dev/tty0 || true
+  - printf '\n%s\n' 'reinstall done' >/dev/tty0 || true

@@ -21,16 +21,18 @@ usage_and_exit() {
 Usage: reinstall.sh centos   7|8|9
                     alma     8|9
                     rocky    8|9
-                    fedora   37|38
+                    fedora   38|39
                     debian   10|11|12
                     ubuntu   20.04|22.04
                     alpine   3.16|3.17|3.18|3.19
-                    opensuse 15.4|15.5|tumbleweed
+                    opensuse 15.5|tumbleweed
                     arch
                     gentoo
                     dd       --img=http://xxx
                     windows  --iso=http://xxx --image-name='windows xxx'
                     netboot.xyz
+
+Homepage: https://github.com/bin456789/reinstall
 EOF
     exit 1
 }
@@ -64,7 +66,7 @@ curl() {
     # 添加 -f, --fail，不然 404 退出码也为0
     # 32位 cygwin 已停止更新，证书可能有问题，先添加 --insecure
     grep -o 'http[^ ]*' <<<"$@" >&2
-    command curl --insecure --connect-timeout 5 --retry 2 --retry-delay 1 -f "$@"
+    command curl --insecure --connect-timeout 10 --retry 5 --retry-delay 1 -f "$@"
 }
 
 is_in_china() {
@@ -256,15 +258,17 @@ is_virt() {
             # https://sources.debian.org/src/hw-detect/1.159/hw-detect.finish-install.d/08hw-detect/
             vmstr='VMware|Virtual|Virtualization|VirtualBox|VMW|Hyper-V|Bochs|QEMU|KVM|OpenStack|KubeVirt|innotek|Xen|Parallels|BHYVE'
             for name in ComputerSystem BIOS BaseBoard; do
-                if wmic $name | grep -Eiwo $vmstr; then
+                if wmic $name get /format:list | grep -Eiw $vmstr; then
                     _is_virt=true
                     break
                 fi
             done
-            if [ -z "$_is_virt" ]; then
-                if wmic /namespace:'\\root\cimv2' PATH Win32_Fan 2>/dev/null | head -1 | grep -q Name; then
-                    _is_virt=false
-                fi
+
+            # 没有风扇和温度信息，大概是虚拟机
+            if [ -z "$_is_virt" ] &&
+                ! wmic /namespace:'\\root\cimv2' PATH Win32_Fan 2>/dev/null | grep -q Name &&
+                ! wmic /namespace:'\\root\wmi' PATH MSAcpi_ThermalZoneTemperature 2>/dev/null | grep -q Name; then
+                _is_virt=true
             fi
         else
             # aws t4g debian 11
@@ -274,6 +278,7 @@ is_virt() {
             if is_have_cmd systemd-detect-virt && systemd-detect-virt -v; then
                 _is_virt=true
             fi
+
             if [ -z "$_is_virt" ]; then
                 # debian 安装 virt-what 不会自动安装 dmidecode，因此结果有误
                 install_pkg dmidecode virt-what
@@ -311,15 +316,12 @@ setos() {
     }
 
     setos_alpine() {
-        flavour=lts
-        if is_virt; then
-            # alpine aarch64 3.18 才有 virt 直连链接
-            if [ "$basearch" = aarch64 ]; then
-                install_pkg bc
-                (($(echo "$releasever >= 3.18" | bc))) && flavour=virt
-            else
-                flavour=virt
-            fi
+        is_virt && flavour=virt || flavour=lts
+
+        # alpine aarch64 3.16/3.17 virt 没有直连链接
+        if [ "$basearch" = aarch64 ] &&
+            { [ "$releasever" = 3.16 ] || [ "$releasever" = 3.17 ]; }; then
+            flavour=lts
         fi
 
         # 不要用https 因为甲骨文云arm initramfs阶段不会从硬件同步时钟，导致访问https出错
@@ -330,8 +332,8 @@ setos() {
         fi
         eval ${step}_vmlinuz=$mirror/releases/$basearch/netboot/vmlinuz-$flavour
         eval ${step}_initrd=$mirror/releases/$basearch/netboot/initramfs-$flavour
-        eval ${step}_repo=$mirror/main
         eval ${step}_modloop=$mirror/releases/$basearch/netboot/modloop-$flavour
+        eval ${step}_repo=$mirror/main
     }
 
     setos_debian() {
@@ -616,11 +618,11 @@ verify_os_name() {
         'centos   7|8|9' \
         'alma     8|9' \
         'rocky    8|9' \
-        'fedora   37|38' \
+        'fedora   38|39' \
         'debian   10|11|12' \
         'ubuntu   20.04|22.04' \
         'alpine   3.16|3.17|3.18|3.19' \
-        'opensuse 15.4|15.5|tumbleweed' \
+        'opensuse 15.5|tumbleweed' \
         'arch' \
         'gentoo' \
         'windows' \
@@ -650,12 +652,6 @@ verify_os_args() {
     windows)
         if [ -z "$iso" ] || [ -z "$image_name" ]; then
             error_and_exit "Install Windows need --iso and --image-name"
-        fi
-        # 防止常见错误
-        # --image-name 肯定大于等于3个单词
-        if [ "$(echo "$image_name" | wc -w)" -lt 3 ] ||
-            [[ "$(to_lower <<<"$image_name")" != windows* ]]; then
-            error_and_exit "--image-name wrong."
         fi
         ;;
     esac
@@ -687,7 +683,25 @@ install_pkg() {
     cmd_to_pkg() {
         unset USE
         case $cmd in
-        lsmem | lsblk | findmnt) pkg="util-linux" ;;
+        lsblk | findmnt)
+            case "$pkg_mgr" in
+            apk) pkg="$cmd" ;;
+            *) pkg="util-linux" ;;
+            esac
+            ;;
+        lsmem)
+            case "$pkg_mgr" in
+            apk) pkg="util-linux-misc" ;;
+            *) pkg="util-linux" ;;
+            esac
+            ;;
+        fdisk)
+            case "$pkg_mgr" in
+            apt) pkg="fdisk" ;;
+            apk) pkg="util-linux-misc" ;;
+            *) pkg="util-linux" ;;
+            esac
+            ;;
         unsquashfs)
             case "$pkg_mgr" in
             zypper) pkg="squashfs" ;;
@@ -708,6 +722,7 @@ install_pkg() {
     }
 
     install_pkg_real() {
+        echo "Installing package '$pkg' for command '$cmd'..."
         case $pkg_mgr in
         dnf) dnf install -y --setopt=install_weak_deps=False $pkg ;;
         yum) yum install -y $pkg ;;
@@ -725,15 +740,30 @@ install_pkg() {
         esac
     }
 
+    is_need_reinstall() {
+        cmd=$1
+
+        # gentoo 默认编译的 unsquashfs 不支持 xz
+        if [ "$cmd" = unsquashfs ] && is_have_cmd emerge && ! $cmd |& grep -wq xz; then
+            echo "unsquashfs not supported xz. rebuilding."
+            return 0
+        fi
+
+        # busybox fdisk 无法显示 mbr 分区表的 id
+        if [ "$cmd" = fdisk ] && is_have_cmd apk && $cmd |& grep -wq BusyBox; then
+            return 0
+        fi
+
+        # busybox grep 无法 grep -oP
+        if [ "$cmd" = grep ] && is_have_cmd apk && $cmd |& grep -wq BusyBox; then
+            return 0
+        fi
+
+        return 1
+    }
+
     for cmd in "$@"; do
-        if ! is_have_cmd $cmd ||
-            {
-                # gentoo 默认编译的 unsquashfs 不支持 xz
-                [ "$cmd" = unsquashfs ] &&
-                    is_have_cmd emerge &&
-                    ! unsquashfs |& grep -w xz &&
-                    echo "unsquashfs not supported xz. need rebuild."
-            }; then
+        if ! is_have_cmd $cmd || is_need_reinstall $cmd; then
             if ! find_pkg_mgr; then
                 error_and_exit "Can't find compatible package manager. Please manually install $cmd."
             fi
@@ -798,14 +828,35 @@ check_ram() {
 
 is_efi() {
     if is_in_windows; then
-        bcdedit | grep -q '^path.*\.efi'
+        # bcdedit | grep -qi '^path.*\.efi'
+        mountvol | grep -q --text 'EFI'
     else
         [ -d /sys/firmware/efi ]
     fi
 }
 
+is_secure_boot_enabled() {
+    if is_efi; then
+        if is_in_windows; then
+            reg query 'HKLM\SYSTEM\CurrentControlSet\Control\SecureBoot\State' /v UEFISecureBootEnabled | grep 0x1
+        else
+            # localhost:~# mokutil --sb-state
+            # SecureBoot disabled
+            # Platform is in Setup Mode
+            dmesg | grep -i 'Secure boot enabled'
+        fi
+    else
+        return 1
+    fi
+}
+
 is_use_grub() {
     ! { is_netboot_xyz && is_efi; }
+}
+
+# 只有 linux bios 是用本机的 grub
+is_use_local_grub() {
+    is_use_grub && ! is_in_windows && ! is_efi
 }
 
 to_upper() {
@@ -820,6 +871,64 @@ del_cr() {
     sed 's/\r//g'
 }
 
+# 记录主硬盘
+find_main_disk() {
+    if is_in_windows; then
+        # TODO:
+        # 已测试 vista
+        # 测试 软raid
+        # 测试 动态磁盘
+
+        # diskpart 命令结果
+        # 磁盘 ID: E5FDE61C
+        # 磁盘 ID: {92CF6564-9B2E-4348-A3BD-D84E3507EBD7}
+        disk_index=$(wmic logicaldisk where "DeviceID='$c:'" assoc:value /resultclass:Win32_DiskPartition |
+            grep 'DiskIndex=' | cut -d= -f2 | del_cr)
+        main_disk=$(printf "%s\n%s" "select disk $disk_index" "uniqueid disk" | diskpart |
+            tail -1 | awk '{print $NF}' | sed 's,[{}],,g' | del_cr)
+    else
+        # centos7下测试     lsblk --inverse $mapper | grep -w disk     grub2-probe -t disk /
+        # 跨硬盘btrfs       只显示第一个硬盘                            显示两个硬盘
+        # 跨硬盘lvm         显示两个硬盘                                显示/dev/mapper/centos-root
+        # 跨硬盘软raid      显示两个硬盘                                显示/dev/md127
+
+        # 改成先检测 /boot/efi /efi /boot 分区？
+
+        install_pkg lsblk
+        # lvm 显示的是 /dev/mapper/xxx-yyy，再用第二条命令得到sda
+        mapper=$(mount | awk '$3=="/" {print $1}')
+        xda=$(lsblk -rn --inverse $mapper | grep -w disk | awk '{print $1}' | sort -u)
+
+        # 检测主硬盘是否横跨多个磁盘
+        os_across_disks_count=$(wc -l <<<"$xda")
+        if [ $os_across_disks_count -eq 1 ]; then
+            info "Main disk: $xda"
+        else
+            error_and_exit "OS across $os_across_disks_count disk: $xda"
+        fi
+
+        # 可以用 dd 找出 guid?
+
+        # centos7 sfdisk 不显示 Disk identifier
+        # 因此用 fdisk
+
+        # Disk identifier: 0x36778223                                  # gnu fdisk + mbr
+        # Disk identifier: D6B17C1A-FA1E-40A1-BDCB-0278A3ED9CFC        # gnu fdisk + gpt
+        # Disk identifier (GUID): d6b17c1a-fa1e-40a1-bdcb-0278a3ed9cfc # busybox fdisk + gpt
+        # 不显示 Disk identifier                                        # busybox fdisk + mbr
+
+        # 获取 xda 的 id
+        install_pkg fdisk
+        main_disk=$(fdisk -l /dev/$xda | grep 'Disk identifier' | awk '{print $NF}' | sed 's/0x//')
+    fi
+
+    # 检查 id 格式是否正确
+    if ! grep -Eix '[0-9a-f]{8}' <<<"$main_disk" &&
+        ! grep -Eix '[0-9a-f-]{36}' <<<"$main_disk"; then
+        error_and_exit "Disk ID is invalid: $main_disk"
+    fi
+}
+
 # TODO: 多网卡 单网卡多IP
 collect_netconf() {
     if is_in_windows; then
@@ -832,10 +941,18 @@ collect_netconf() {
 
         # 部分机器精简了 powershell
         # 所以不要用 powershell 获取网络信息
-        ids=$(wmic nic where "PhysicalAdapter=true and MACAddress is not null and PNPDeviceID like '%VEN_%&DEV_%'" get InterfaceIndex | del_cr | sed '1d')
+        # ids=$(wmic nic where "PhysicalAdapter=true and MACAddress is not null and (PNPDeviceID like '%VEN_%&DEV_%' or PNPDeviceID like '%{F8615163-DF3E-46C5-913F-F2D2F965ED0E}%')" get InterfaceIndex | del_cr | sed '1d')
+
+        # 否        手动        0    0.0.0.0/0                  19  192.168.1.1
+        # 否        手动        0    0.0.0.0/0                  59  nekoray-tun
+        ids="
+        $(netsh int ipv4 show route | grep --text -F '0.0.0.0/0' | awk '$6 ~ /\./ {print $5}')
+        $(netsh int ipv6 show route | grep --text -F '::/0' | awk '$6 ~ /:/ {print $5}')
+        "
+        ids=$(echo "$ids" | sort -u)
         for id in $ids; do
             config=$(wmic nicconfig where "InterfaceIndex='$id'" get MACAddress,IPAddress,IPSubnet,DefaultIPGateway /format:list | del_cr)
-            # 排除 IP/子网/网关为空的
+            # 排除 IP/子网/网关/MAC 为空的
             if grep -q '=$' <<<"$config"; then
                 continue
             fi
@@ -934,6 +1051,13 @@ add_efi_entry_in_windows() {
     mkdir -p $dist_dir
     cp -f "$source" "$dist_dir/$basename"
 
+    # 如果 {fwbootmgr} displayorder 为空
+    # 执行 bcdedit /copy '{bootmgr}' 会报错
+    # 例如 azure windows 2016 模板
+    # 要先设置默认的 {fwbootmgr} displayorder
+    # https://github.com/hakuna-m/wubiuefi/issues/286
+    bcdedit /set '{fwbootmgr}' displayorder '{bootmgr}' /addfirst
+
     # 添加启动项
     id=$(bcdedit /copy '{bootmgr}' /d "$(get_entry_name)" | grep -o '{.*}')
     bcdedit /set $id device partition=$x:
@@ -942,7 +1066,23 @@ add_efi_entry_in_windows() {
 }
 
 get_maybe_efi_dirs_in_linux() {
-    mount | awk '$5=="vfat" {print $3}' | grep -E '/boot|/efi'
+    # arch云镜像efi分区挂载在/efi，且使用 autofs，挂载后会有两个 /efi 条目
+    mount | awk '$5=="vfat" || $5=="autofs" {print $3}' | grep -E '/boot|/efi' | sort -u
+}
+
+get_disk_by_part() {
+    dev_part=$1
+    install_pkg lsblk >&2
+    lsblk -rn --inverse "$dev_part" | grep -w disk | awk '{print $1}'
+}
+
+get_part_num_by_part() {
+    dev_part=$1
+    grep -oE '[0-9]*$' <<<"$dev_part"
+}
+
+grep_efi_index() {
+    awk -F '*' '{print $1}' | sed 's/Boot//'
 }
 
 add_efi_entry_in_linux() {
@@ -955,22 +1095,76 @@ add_efi_entry_in_linux() {
             dist_dir=$efi_part/EFI/reinstall
             basename=$(basename $source)
             mkdir -p $dist_dir
-            cp -f "$source" "$dist_dir/$basename"
 
-            # disk=$($grub-probe -t device "$dist")
-            install_pkg findmnt
-            disk=$(findmnt -T "$dist_dir" -no SOURCE)
-            efibootmgr --quiet --create-only \
-                --disk "$disk" \
+            if [[ "$source" = http* ]]; then
+                curl -Lo "$dist_dir/$basename" "$source"
+            else
+                cp -f "$source" "$dist_dir/$basename"
+            fi
+
+            if false; then
+                grub_probe="$(command -v grub-probe grub2-probe)"
+                dev_part="$("$grub_probe" -t device "$dist_dir")"
+            else
+                install_pkg findmnt
+                # arch findmnt 会得到
+                # systemd-1
+                # /dev/sda2
+                dev_part=$(findmnt -T "$dist_dir" -no SOURCE | grep '^/dev/')
+            fi
+
+            id=$(efibootmgr --create-only \
+                --disk "/dev/$(get_disk_by_part $dev_part)" \
+                --part "$(get_part_num_by_part $dev_part)" \
                 --label "$(get_entry_name)" \
-                --loader "\\EFI\\reinstall\\$basename"
-            id=$(efibootmgr | grep "$(get_entry_name)" | grep -oE '[0-9]{4}')
+                --loader "\\EFI\\reinstall\\$basename" |
+                tail -1 | grep_efi_index)
             efibootmgr --bootnext $id
             return
         fi
     done
 
     error_and_exit "Can't find efi partition."
+}
+
+install_grub_linux_efi() {
+    info 'download grub efi'
+
+    if [ "$basearch" = aarch64 ]; then
+        grub_efi=grubaa64.efi
+    else
+        grub_efi=grubx64.efi
+    fi
+
+    # fedora 39 的 efi 无法识别 opensuse tumbleweed 的 xfs
+    efi_distro=opensuse
+
+    # 不要用 download.opensuse.org 和 download.fedoraproject.org
+    # 因为 ipv6 访问有时跳转到 ipv4 地址，造成 ipv6 only 机器无法下载
+    # 日韩机器有时得到国内链接，且连不上
+    if [ "$efi_distro" = fedora ]; then
+        fedora_ver=39
+
+        if is_in_china; then
+            mirror=https://mirrors.tuna.tsinghua.edu.cn/fedora
+        else
+            mirror=https://mirror.fcix.net/fedora/linux
+        fi
+
+        curl -Lo /tmp/$grub_efi $mirror/releases/$fedora_ver/Everything/$basearch/os/EFI/BOOT/$grub_efi
+    else
+        if is_in_china; then
+            mirror=https://mirror.sjtu.edu.cn/opensuse
+        else
+            mirror=https://mirror.fcix.net/opensuse
+        fi
+
+        [ "$basearch" = x86_64 ] && ports='' || ports=/ports/$basearch
+
+        curl -Lo /tmp/$grub_efi $mirror$ports/tumbleweed/repo/oss/EFI/BOOT/grub.efi
+    fi
+
+    add_efi_entry_in_linux /tmp/$grub_efi
 }
 
 install_grub_win() {
@@ -985,41 +1179,69 @@ install_grub_win() {
     grub_dir=/tmp/grub-$grub_ver-for-windows
     grub=$grub_dir/grub
 
-    # 设置 grub 内嵌的模块
-    grub_modules+=" normal minicmd ls echo test cat reboot halt linux linux16 chain search all_video configfile"
-    grub_modules+=" scsi part_msdos part_gpt fat ntfs ntfscomp ext2 lvm xfs lzopio xzio gzio zstd"
+    # 设置 grub 包含的模块
+    # 原系统是 windows，因此不需要 ext2 lvm xfs btrfs
+    grub_modules+=" normal minicmd serial ls echo test cat reboot halt linux chain search all_video configfile"
+    grub_modules+=" scsi part_msdos part_gpt fat ntfs ntfscomp lzopio xzio gzio zstd"
     if ! is_efi; then
-        grub_modules+=" biosdisk"
+        grub_modules+=" biosdisk linux16"
     fi
 
     # 设置 grub prefix 为c盘根目录
     # 运行 grub-probe 会改变cmd窗口字体
-    prefix=$($grub-probe -t drive $c: | sed 's,.*PhysicalDrive,(hd,' | sed 's,\r,,')/
+    prefix=$($grub-probe -t drive $c: | sed 's|.*PhysicalDrive|(hd|' | del_cr)/
     echo $prefix
 
     # 安装 grub
     if is_efi; then
         # efi
         info install grub for efi
-        $grub-mkimage -p $prefix -O x86_64-efi -o "$(cygpath -w $grub_dir/grubx64.efi)" $grub_modules
-        add_efi_entry_in_windows $grub_dir/grubx64.efi
+        if [ "$basearch" = aarch64 ]; then
+            alpine_ver=3.19
+            is_in_china && mirror=http://mirrors.tuna.tsinghua.edu.cn/alpine || mirror=https://dl-cdn.alpinelinux.org/alpine
+            grub_efi_apk=$(curl -L $mirror/v$alpine_ver/main/aarch64/ | grep -oP 'grub-efi-.*?apk' | head -1)
+            mkdir -p /tmp/grub-efi
+            curl -L "$mirror/v$alpine_ver/main/aarch64/$grub_efi_apk" | tar xz --warning=no-unknown-keyword -C /tmp/grub-efi/
+            cp -r /tmp/grub-efi/usr/lib/grub/arm64-efi/ $grub_dir
+            $grub-mkimage -p $prefix -O arm64-efi -o "$(cygpath -w $grub_dir/grubaa64.efi)" $grub_modules
+            add_efi_entry_in_windows $grub_dir/grubaa64.efi
+        else
+            $grub-mkimage -p $prefix -O x86_64-efi -o "$(cygpath -w $grub_dir/grubx64.efi)" $grub_modules
+            add_efi_entry_in_windows $grub_dir/grubx64.efi
+        fi
     else
         # bios
         info install grub for bios
 
-        # bootmgr 加载 g2ldr 有64k限制
+        # bootmgr 加载 g2ldr 有大小限制
+        # 超过大小会报错 0xc000007b
         # 解决方法1 g2ldr.mbr + g2ldr
         # 解决方法2 生成少于64K的 g2ldr + 动态模块
+        if false; then
+            # g2ldr.mbr
+            # 部分国内机无法访问 ftp.cn.debian.org
+            is_in_china && host=mirrors.tuna.tsinghua.edu.cn || host=deb.debian.org
+            curl -LO http://$host/debian/tools/win32-loader/stable/win32-loader.exe
+            7z x win32-loader.exe 'g2ldr.mbr' -o/tmp/win32-loader -r -y -bso0
+            find /tmp/win32-loader -name 'g2ldr.mbr' -exec cp {} /cygdrive/$c/ \;
 
-        # g2ldr.mbr
-        is_in_china && host=ftp.cn.debian.org || host=deb.debian.org
-        curl -LO http://$host/debian/tools/win32-loader/stable/win32-loader.exe
-        7z x win32-loader.exe 'g2ldr.mbr' -o/tmp/win32-loader -r -y -bso0
-        find /tmp/win32-loader -name 'g2ldr.mbr' -exec cp {} /cygdrive/$c/ \;
+            # g2ldr
+            # 配置文件 c:\grub.cfg
+            $grub-mkimage -p "$prefix" -O i386-pc -o "$(cygpath -w $grub_dir/core.img)" $grub_modules
+            cat $grub_dir/i386-pc/lnxboot.img $grub_dir/core.img >/cygdrive/$c/g2ldr
+        else
+            # grub-install 无法设置 prefix
+            # 配置文件 c:\grub\grub.cfg
+            $grub-install $c \
+                --target=i386-pc \
+                --boot-directory=$c: \
+                --install-modules="$grub_modules" \
+                --themes= \
+                --fonts= \
+                --no-bootsector
 
-        # g2ldr
-        $grub-mkimage -p "$prefix" -O i386-pc -o "$(cygpath -w $grub_dir/core.img)" $grub_modules
-        cat $grub_dir/i386-pc/lnxboot.img $grub_dir/core.img >/cygdrive/$c/g2ldr
+            cat $grub_dir/i386-pc/lnxboot.img /cygdrive/$c/grub/i386-pc/core.img >/cygdrive/$c/g2ldr
+        fi
 
         # 添加引导
         # 脚本可能不是首次运行，所以先删除原来的
@@ -1027,7 +1249,7 @@ install_grub_win() {
         bcdedit /enum all | grep --text $id && bcdedit /delete $id
         bcdedit /create $id /d "$(get_entry_name)" /application bootsector
         bcdedit /set $id device partition=$c:
-        bcdedit /set $id path \\g2ldr.mbr
+        bcdedit /set $id path \\g2ldr
         bcdedit /displayorder $id /addlast
         bcdedit /bootsequence $id /addfirst
     fi
@@ -1047,7 +1269,7 @@ build_finalos_cmdline() {
 }
 
 build_extra_cmdline() {
-    for key in confhome hold cloud_image kernel deb_hostname; do
+    for key in confhome hold cloud_image kernel deb_hostname main_disk; do
         value=${!key}
         if [ -n "$value" ]; then
             extra_cmdline+=" extra.$key='$value'"
@@ -1067,9 +1289,11 @@ echo_tmp_ttys() {
 }
 
 get_entry_name() {
-    printf 'reinstall (%s%s%s)' "$distro" \
-        "$([ -n "$releasever" ] && printf ' %s' "$releasever")" \
-        "$([ "$distro" = alpine ] && [ "$hold" = 1 ] && printf ' Live OS')"
+    printf 'reinstall ('
+    printf '%s' "$distro"
+    [ -n "$releasever" ] && printf ' %s' "$releasever"
+    [ "$distro" = alpine ] && [ "$hold" = 1 ] && printf ' Live OS'
+    printf ')'
 }
 
 # shellcheck disable=SC2154
@@ -1077,7 +1301,7 @@ build_nextos_cmdline() {
     if [ $nextos_distro = alpine ]; then
         nextos_cmdline="alpine_repo=$nextos_repo modloop=$nextos_modloop"
     elif [ $nextos_distro = debian ]; then
-        nextos_cmdline="lowmem=+1 lowmem/low=1 auto=true priority=critical url=$nextos_ks"
+        nextos_cmdline="lowmem/low=1 auto=true priority=critical url=$nextos_ks"
     else
         # redhat
         nextos_cmdline="root=live:$nextos_squashfs inst.ks=$nextos_ks"
@@ -1161,20 +1385,29 @@ mod_alpine_initrd() {
 EOF
 
     # hack 2 设置 ethx
+    # 3.16~3.18 ip_choose_if
+    # 3.19.1+ ethernets
+    if grep -q ip_choose_if init; then
+        ethernets_func=ip_choose_if
+    else
+        ethernets_func=ethernets
+    fi
+
     ip_choose_if() {
         ip -o link | grep "@mac_addr" | awk '{print $2}' | cut -d: -f1
         return
     }
 
     collect_netconf
-    get_function_content ip_choose_if | sed "s/@mac_addr/$mac_addr/" | insert_into_file init after 'ip_choose_if\(\)'
+    get_function_content ip_choose_if | sed "s/@mac_addr/$mac_addr/" |
+        insert_into_file init after "$ethernets_func\(\)"
 
     # hack 3
     # udhcpc 添加 -n 参数，请求dhcp失败后退出
     # 使用同样参数运行 udhcpc6
-    # TODO: digitalocean -i eth1?
-    # $MOCK udhcpc -i "$device" -f -q # v3.18
     #       udhcpc -i "$device" -f -q # v3.17
+    # $MOCK udhcpc -i "$device" -f -q # v3.18
+    # $MOCK udhcpc -i "$iface" -f -q  # v3.19.1
     search='udhcpc -i'
     orig_cmd="$(grep "$search" init)"
     mod_cmd4="$orig_cmd -n || true"
@@ -1241,10 +1474,13 @@ EOF
 
 # 脚本入口
 # 检查 root
-if ! is_in_windows; then
+if is_in_windows; then
+    if ! openfiles >/dev/null 2>&1; then
+        error_and_exit "Please run as administrator."
+    fi
+else
     if [ "$EUID" -ne 0 ]; then
-        info "Please run as root."
-        exit 1
+        error_and_exit "Please run as root."
     fi
 fi
 
@@ -1292,14 +1528,19 @@ while true; do
     esac
 done
 
-# 不支持容器虚拟化
-assert_not_in_container
-
 # 检查目标系统名
 verify_os_name "$@"
 
 # 检查必须的参数
 verify_os_args
+
+# 不支持容器虚拟化
+assert_not_in_container
+
+# 不支持安全启动
+if is_secure_boot_enabled; then
+    error_and_exit "Not Supported with secure boot enabled."
+fi
 
 # win系统盘
 if is_in_windows; then
@@ -1307,11 +1548,7 @@ if is_in_windows; then
 fi
 
 # 必备组件
-install_pkg curl
-# alpine 自带的 grep 是 busybox 里面的， 要下载完整版grep
-if is_in_alpine; then
-    apk add grep
-fi
+install_pkg curl grep
 
 # 检查内存
 if ! { [ "$distro" = dd ] || [ "$distro" = windows ] || [ "$distro" = netboot.xyz ]; }; then
@@ -1324,13 +1561,30 @@ if [ "$distro" = alpine ] && is_use_cloud_image; then
 fi
 
 # 检查硬件架构
-# x86强制使用x64
-# archlinux 云镜像没有 arch 命令
-basearch=$(uname -m)
-[ $basearch = i686 ] && basearch=x86_64
-case "$basearch" in
-"x86_64") basearch_alt=amd64 ;;
-"aarch64") basearch_alt=arm64 ;;
+if is_in_windows; then
+    # x86-based PC
+    # x64-based PC
+    # ARM-based PC
+    # ARM64-based PC
+    basearch=$(wmic ComputerSystem get SystemType /format:list |
+        grep '=' | cut -d= -f2 | cut -d- -f1)
+else
+    # archlinux 云镜像没有 arch 命令
+    # https://en.wikipedia.org/wiki/Uname
+    basearch=$(uname -m)
+fi
+
+# 统一架构名称，并强制 64 位
+case "$(echo $basearch | to_lower)" in
+i?86 | x64 | x86* | amd64)
+    basearch=x86_64
+    basearch_alt=amd64
+    ;;
+arm* | aarch64)
+    basearch=aarch64
+    basearch_alt=arm64
+    ;;
+*) error_and_exit "Unsupported arch: $basearch" ;;
 esac
 
 # 设置国内代理
@@ -1372,32 +1626,22 @@ if is_efi; then
         rm -f /cygdrive/$c/grub.cfg
 
         bcdedit /set '{fwbootmgr}' bootsequence '{bootmgr}'
-        bcdedit /enum bootmgr | grep --text -B3 'reinstall.*' | awk '{print $2}' | grep '{.*}' |
+        bcdedit /enum bootmgr | grep --text -B3 'reinstall' | awk '{print $2}' | grep '{.*}' |
             xargs -I {} cmd /c bcdedit /delete {}
     else
-        maybe_efi_dirs=$(get_maybe_efi_dirs_in_linux)
-        find $maybe_efi_dirs /boot -type f -name 'custom.cfg' -exec rm -f {} \;
+        # shellcheck disable=SC2046
+        find $(get_maybe_efi_dirs_in_linux) /boot -type f -name 'custom.cfg' -exec rm -f {} \;
 
         install_pkg efibootmgr
         efibootmgr | grep -q 'BootNext:' && efibootmgr --quiet --delete-bootnext
-        efibootmgr | grep 'reinstall.*' | grep -oE '[0-9]{4}' |
+        efibootmgr | grep 'reinstall' | grep_efi_index |
             xargs -I {} efibootmgr --quiet --bootnum {} --delete-bootnum
     fi
 fi
 
-# grub
-if is_use_grub; then
-    if is_in_windows; then
-        install_grub_win
-    else
-        if is_have_cmd grub2-mkconfig; then
-            grub=grub2
-        elif is_have_cmd grub-mkconfig; then
-            grub=grub
-        else
-            error_and_exit "grub not found"
-        fi
-    fi
+# 有的机器开启了 kexec，例如腾讯云轻量 debian，要禁用
+if ! is_in_windows && [ -f /etc/default/kexec ]; then
+    sed -i 's/LOAD_KEXEC=true/LOAD_KEXEC=false/' /etc/default/kexec
 fi
 
 # 下载 netboot.xyz / 内核
@@ -1418,43 +1662,82 @@ else
     info download vmlnuz and initrd
     curl -Lo /reinstall-vmlinuz $nextos_vmlinuz
     curl -Lo /reinstall-initrd $nextos_initrd
+fi
 
-    if [ "$nextos_distro" = alpine ]; then
-        mod_alpine_initrd
+# 修改 alpine initrd
+if [ "$nextos_distro" = alpine ]; then
+    mod_alpine_initrd
+fi
+
+# 将内核/netboot.xyz.lkrn 放到正确的位置
+if is_use_grub; then
+    if is_in_windows; then
+        cp -f /reinstall-vmlinuz /cygdrive/$c/
+        is_have_initrd && cp -f /reinstall-initrd /cygdrive/$c/
+    else
+        if is_os_in_btrfs && is_os_in_subvol; then
+            cp_to_btrfs_root /reinstall-vmlinuz
+            is_have_initrd && cp_to_btrfs_root /reinstall-initrd
+        fi
     fi
 fi
 
+# grub
 if is_use_grub; then
-    info 'create grub config'
-    # linux grub
-    if ! is_in_windows; then
-        if is_have_cmd update-grub; then
-            # alpine debian ubuntu
-            grub_cfg=$(grep -o '[^ ]*grub.cfg' "$(get_cmd_path update-grub)" | head -1)
-        else
-            # 找出主配置文件（含有menuentry|blscfg）
-            # 如果是efi，先搜索efi目录
-            # arch云镜像efi分区挂载在/efi
-            if is_efi; then
-                efi_dir=$(get_maybe_efi_dirs_in_linux)
-            fi
-            grub_cfg=$(
-                find $efi_dir /boot/grub* \
-                    -type f -name grub.cfg \
-                    -exec grep -E -l 'menuentry|blscfg' {} \;
-            )
+    # win 使用外部 grub
+    if is_in_windows; then
+        install_grub_win
+    else
+        # linux aarch64 原系统的 grub 可能无法启动 alpine 3.19 的内核
+        # 要用去除了内核 magic number 校验的 grub
+        # 为了方便测试，linux x86 efi 也采用外部 grub
+        if is_efi; then
+            install_grub_linux_efi
+        fi
+    fi
 
-            if [ "$(wc -l <<<"$grub_cfg")" -gt 1 ]; then
-                error_and_exit 'find multi grub.cfg files.'
+    info 'create grub config'
+
+    # 寻找 grub.cfg
+    if is_in_windows; then
+        if is_efi; then
+            grub_cfg=/cygdrive/$c/grub.cfg
+        else
+            grub_cfg=/cygdrive/$c/grub/grub.cfg
+        fi
+    else
+        # linux
+        if is_efi; then
+            # 现在 linux-efi 是使用 reinstall 目录下的 grub
+            # shellcheck disable=SC2046
+            efi_reinstall_dir=$(find $(get_maybe_efi_dirs_in_linux) -type d -name "reinstall" | head -1)
+            grub_cfg=$efi_reinstall_dir/grub.cfg
+        else
+            if is_have_cmd update-grub; then
+                # alpine debian ubuntu
+                grub_cfg=$(grep -o '[^ ]*grub.cfg' "$(get_cmd_path update-grub)" | head -1)
+            else
+                # 找出主配置文件（含有menuentry|blscfg）
+                # 现在 efi 用下载的 grub，因此不需要查找 efi 目录
+                grub_cfg=$(
+                    find /boot/grub* \
+                        -type f -name grub.cfg \
+                        -exec grep -E -l 'menuentry|blscfg' {} \;
+                )
+
+                if [ "$(wc -l <<<"$grub_cfg")" -gt 1 ]; then
+                    error_and_exit 'find multi grub.cfg files.'
+                fi
             fi
         fi
+    fi
 
-        # 有些机子例如hython debian的grub.cfg少了40_custom 41_custom
-        # 所以先重新生成 grub.cfg
-        $grub-mkconfig -o $grub_cfg
-
+    # 判断用 linux 还是 linuxefi（主要是红帽系）
+    # 现在 efi 用下载的 grub，因此不需要判断 linux 或 linuxefi
+    if false && is_use_local_grub; then
         # 在x86 efi机器上，不同版本的 grub 可能用 linux 或 linuxefi 加载内核
         # 通过检测原有的条目有没有 linuxefi 字样就知道当前 grub 用哪一种
+        # 也可以检测 /etc/grub.d/10_linux
         if [ -d /boot/loader/entries/ ]; then
             entries="/boot/loader/entries/"
         fi
@@ -1463,44 +1746,53 @@ if is_use_grub; then
         fi
     fi
 
-    # 生成 custom.cfg (linux) 或者 grub.cfg (win)
-    is_in_windows && custom_cfg=/cygdrive/$c/grub.cfg || custom_cfg=$(dirname $grub_cfg)/custom.cfg
+    # 找到 grub 程序的前缀
+    # 并重新生成 grub.cfg
+    # 因为有些机子例如hython debian的grub.cfg少了40_custom 41_custom
+    if is_use_local_grub; then
+        if is_have_cmd grub2-mkconfig; then
+            grub=grub2
+        elif is_have_cmd grub-mkconfig; then
+            grub=grub
+        else
+            error_and_exit "grub not found"
+        fi
+        $grub-mkconfig -o $grub_cfg
+    fi
 
+    # 选择用 custom.cfg (linux-bios) 还是 grub.cfg (win/linux-efi)
+    if is_use_local_grub; then
+        target_cfg=$(dirname $grub_cfg)/custom.cfg
+    else
+        target_cfg=$grub_cfg
+    fi
+
+    # 生成 linux initrd 命令
     if is_netboot_xyz; then
         linux_cmd="linux16 /reinstall-vmlinuz"
     else
+        find_main_disk
         build_cmdline
         linux_cmd="linux$efi /reinstall-vmlinuz $cmdline"
         initrd_cmd="initrd$efi /reinstall-initrd"
     fi
 
-    echo $custom_cfg
-    cat <<EOF | tee $custom_cfg
+    # 生成 grub 配置
+    # 实测 centos 7 lvm 要手动加载 lvm 模块
+    echo $target_cfg
+    cat <<EOF | tee $target_cfg
 set timeout=5
 menuentry "$(get_entry_name)" {
+    $(is_in_windows || echo 'insmod lvm')
     insmod all_video
-    insmod lvm
-    insmod xfs
     search --no-floppy --file --set=root /reinstall-vmlinuz
     $linux_cmd
     $initrd_cmd
 }
 EOF
 
-    if is_in_windows; then
-        mv /reinstall-vmlinuz /cygdrive/$c/
-        is_have_initrd && mv /reinstall-initrd /cygdrive/$c/
-    else
-        if is_os_in_btrfs && is_os_in_subvol; then
-            cp_to_btrfs_root /reinstall-vmlinuz
-            is_have_initrd && cp_to_btrfs_root /reinstall-initrd
-        fi
-
-        # 有的机器开启了 kexec，例如腾讯云轻量 debian，要禁用
-        if [ -f /etc/default/kexec ]; then
-            sed -i 's/LOAD_KEXEC=true/LOAD_KEXEC=false/' /etc/default/kexec
-        fi
-
+    # 设置重启引导项
+    if is_use_local_grub; then
         $grub-reboot "$(get_entry_name)"
     fi
 fi

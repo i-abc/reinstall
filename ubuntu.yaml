@@ -27,7 +27,9 @@ autoinstall:
       done
 
       # 生成分区信息
-      curl -L $confhome/ubuntu-storage-early.sh | bash -s
+      xda=$(curl -L "$confhome/get-xda.sh" | sh -s)
+      export xda
+      curl -L "$confhome/ubuntu-storage-early.sh" | sh -s
 
       # 内核风味
       # https://bugs.launchpad.net/subiquity/+bug/1989353
@@ -55,7 +57,7 @@ autoinstall:
 
       # 下载合并分区脚本
       cd /target
-      curl -O $confhome/resize.sh
+      curl -LO $confhome/resize.sh
 
       # 升级 cloud-init
       # curtin in-target --target=/target -- apt update
