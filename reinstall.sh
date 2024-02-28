@@ -5,6 +5,9 @@ set -eE
 confhome=https://raw.githubusercontent.com/i-abc/reinstall/main
 github_proxy=https://gh.888853.xyz/gh-love
 
+# https://www.gnu.org/software/gettext/manual/html_node/The-LANGUAGE-variable.html
+export LC_ALL=C
+
 this_script=$(realpath "$0")
 trap 'trap_err $LINENO $?' ERR
 
