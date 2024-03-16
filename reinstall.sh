@@ -1478,6 +1478,13 @@ EOF
     sed -Ei "s/(^[[:space:]]*set[[:space:]].*)E/\1/" $tmp_dir/trans.sh
     sed -Ei "s/^[[:space:]]*apk[[:space:]]/$replace/" $tmp_dir/trans.sh
     sed -Ei "s/^[[:space:]]*trap[[:space:]]/$replace/" $tmp_dir/trans.sh
+
+    # cygwin 无法删除 initrd 里面的 /dev/console /dev/null
+    # 重新打包 initrd 也会提示 cpio: ./dev/console: Cannot stat: Bad address
+    # 删除后没有副作用
+    for file in console null; do
+        mv "dev/$file" "$(mktemp -u)"
+    done
 }
 
 mod_initrd_alpine() {
