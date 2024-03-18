@@ -53,10 +53,20 @@ add_community_repo() {
     fi
 }
 
+# 有时网络问题下载失败，导致脚本中断
+# 因此需要重试
+apk() {
+    for i in $(seq 5); do
+        command apk "$@" && return
+        sleep 1
+    done
+}
+
 # busybox 的 wget 没有重试功能
 wget() {
     for i in $(seq 5); do
         command wget "$@" && return
+        sleep 1
     done
 }
 
@@ -88,9 +98,13 @@ download() {
         fi
     fi
 
-    # stdbuf 在 coreutils 包里面
     if ! is_have_cmd aria2c; then
-        apk add aria2 coreutils
+        apk add aria2
+    fi
+
+    # stdbuf 在 coreutils 包里面
+    if ! is_have_cmd stdbuf; then
+        apk add coreutils
     fi
 
     # 阿里云源检测 user-agent 禁止 axel/aria2 下载
@@ -116,6 +130,7 @@ download() {
             --user-agent=Wget/1.21.1 \
             --max-tries 1 \
             $save $url && return
+        sleep 1
     done
 }
 
@@ -217,23 +232,38 @@ find_xda() {
     fi
 
     # busybox fdisk 不显示 mbr 分区表 id
+    # 可用以下工具：
     # fdisk 在 util-linux-misc 里面，占用大
     # sfdisk 占用小
+    # lsblk
 
-    apk add sfdisk
+    tool=sfdisk
 
-    for disk in $(get_all_disks); do
-        if sfdisk --disk-id "/dev/$disk" | sed 's/0x//' | grep -ix "$main_disk"; then
-            xda=$disk
-            break
-        fi
-    done
+    is_have_cmd $tool && need_install_tool=false || need_install_tool=true
+    if $need_install_tool; then
+        apk add $tool
+    fi
+
+    if [ "$tool" = sfdisk ]; then
+        # sfdisk
+        for disk in $(get_all_disks); do
+            if sfdisk --disk-id "/dev/$disk" | sed 's/0x//' | grep -ix "$main_disk"; then
+                xda=$disk
+                break
+            fi
+        done
+    else
+        # lsblk
+        xda=$(lsblk --nodeps -rno NAME,PTUUID | grep -iw "$main_disk" | awk '{print $1}')
+    fi
 
     if [ -z "$xda" ]; then
         error_and_exit "Could not find xda: $main_disk"
     fi
 
-    apk del sfdisk
+    if $need_install_tool; then
+        apk del $tool
+    fi
 }
 
 get_all_disks() {
@@ -301,7 +331,7 @@ umount_all() {
 
 # 可能脚本不是首次运行，先清理之前的残留
 clear_previous() {
-    qemu-nbd -d /dev/nbd0 2>/dev/null || true
+    disconnect_qcow
     swapoff -a
     umount_all
 
@@ -350,10 +380,11 @@ get_netconf_to() {
     esac
 
     # shellcheck disable=SC2154
+    # debian initrd 没有 xargs
     case "$1" in
     slaac) echo "$ra" | grep 'Autonomous address conf' | grep Yes && res=1 || res=0 ;;
     dhcpv6) echo "$ra" | grep 'Stateful address conf' | grep Yes && res=1 || res=0 ;;
-    rdnss) res=$(echo "$ra" | grep 'Recursive DNS server' | cut -d: -f2- | xargs) ;;
+    rdnss) res=$(echo "$ra" | grep 'Recursive DNS server' | cut -d: -f2-) ;;
     other) echo "$ra" | grep 'Stateful other conf' | grep Yes && res=1 || res=0 ;;
     *) res=$(cat /dev/$1) ;;
     esac
@@ -459,11 +490,21 @@ is_need_manual_set_dnsv6() {
 }
 
 get_current_dns_v4() {
-    grep '^nameserver' /etc/resolv.conf | awk '{print $2}' | grep '\.'
+    # debian 11 initrd 没有 awk
+    if false; then
+        grep '^nameserver' /etc/resolv.conf | awk '{print $2}' | grep '\.'
+    else
+        grep '^nameserver' /etc/resolv.conf | cut -d' ' -f2 | grep '\.'
+    fi
 }
 
 get_current_dns_v6() {
-    grep '^nameserver' /etc/resolv.conf | awk '{print $2}' | grep ':'
+    # debian 11 initrd 没有 awk
+    if false; then
+        grep '^nameserver' /etc/resolv.conf | awk '{print $2}' | grep ':'
+    else
+        grep '^nameserver' /etc/resolv.conf | cut -d' ' -f2 | grep ':'
+    fi
 }
 
 to_upper() {
@@ -586,6 +627,83 @@ insert_into_file() {
     fi
 }
 
+create_ifupdown_config() {
+    conf_file=$1
+
+    rm -f $conf_file
+
+    # shellcheck disable=SC2154
+    if [ "$distro" = debian ]; then
+        cat <<EOF >>$conf_file
+source /etc/network/interfaces.d/*
+
+EOF
+    fi
+
+    # 生成 lo配置 + ethx头部
+    get_netconf_to ethx
+    if [ -f /etc/network/devhotplug ] && grep -wo "$ethx" /etc/network/devhotplug; then
+        mode=allow-hotplug
+    else
+        mode=auto
+    fi
+    cat <<EOF >>$conf_file
+auto lo
+iface lo inet loopback
+
+$mode $ethx
+EOF
+
+    # ipv4
+    if is_dhcpv4; then
+        echo "iface $ethx inet dhcp" >>$conf_file
+
+    elif is_staticv4; then
+        get_netconf_to ipv4_addr
+        get_netconf_to ipv4_gateway
+        cat <<EOF >>$conf_file
+iface $ethx inet static
+    address $ipv4_addr
+    gateway $ipv4_gateway
+EOF
+        # dns
+        if list=$(get_current_dns_v4); then
+            for dns in $list; do
+                cat <<EOF >>$conf_file
+    dns-nameservers $dns
+EOF
+            done
+        fi
+    fi
+
+    # ipv6
+    if is_slaac; then
+        echo "iface $ethx inet6 auto" >>$conf_file
+
+    elif is_dhcpv6; then
+        echo "iface $ethx inet6 dhcp" >>$conf_file
+
+    elif is_staticv6; then
+        get_netconf_to ipv6_addr
+        get_netconf_to ipv6_gateway
+        cat <<EOF >>$conf_file
+iface $ethx inet6 static
+    address $ipv6_addr
+    gateway $ipv6_gateway
+EOF
+    fi
+
+    # dns
+    # 有 ipv6 但需设置 dns 的情况
+    if is_need_manual_set_dnsv6 && list=$(get_current_dns_v6); then
+        for dns in $list; do
+            cat <<EOF >>$conf_file
+    dns-nameserver $dns
+EOF
+        done
+    fi
+}
+
 install_alpine() {
     hack_lowram_modloop=true
     hack_lowram_swap=true
@@ -649,66 +767,8 @@ install_alpine() {
     sed -i '/^#slaac hwaddr/s/^#//' /etc/dhcpcd.conf
     rc-update add networking boot
 
-    get_netconf_to ethx
-
-    # 生成 lo配置 + ethx头部
-    cat <<EOF >/etc/network/interfaces
-auto lo
-iface lo inet loopback
-
-auto $ethx
-EOF
-
-    # ipv4
-    if is_dhcpv4; then
-        echo "iface $ethx inet dhcp" >>/etc/network/interfaces
-
-    elif is_staticv4; then
-        get_netconf_to ipv4_addr
-        get_netconf_to ipv4_gateway
-        cat <<EOF >>/etc/network/interfaces
-iface $ethx inet static
-    address $ipv4_addr
-    gateway $ipv4_gateway
-EOF
-        # dns
-        if list=$(get_current_dns_v4); then
-            for dns in $list; do
-                cat <<EOF >>/etc/network/interfaces
-    dns-nameserver $dns
-EOF
-            done
-        fi
-    fi
-
-    # ipv6
-    if is_slaac; then
-        echo "iface $ethx inet6 auto" >>/etc/network/interfaces
-
-    elif is_dhcpv6; then
-        echo "iface $ethx inet6 dhcp" >>/etc/network/interfaces
-
-    elif is_staticv6; then
-        get_netconf_to ipv6_addr
-        get_netconf_to ipv6_gateway
-        cat <<EOF >>/etc/network/interfaces
-iface $ethx inet6 static
-    address $ipv6_addr
-    gateway $ipv6_gateway
-EOF
-    fi
-
-    # dns
-    # 有 ipv6 但需设置 dns 的情况
-    if is_need_manual_set_dnsv6 && list=$(get_current_dns_v6); then
-        for dns in $list; do
-            cat <<EOF >>/etc/network/interfaces
-    dns-nameserver $dns
-EOF
-        done
-    fi
-
-    # 显示网络配置
+    # 网络配置
+    create_ifupdown_config /etc/network/interfaces
     echo
     cat -n /etc/network/interfaces
     echo
@@ -1218,7 +1278,7 @@ modify_windows() {
 
     # 下载共同的子脚本
     # 可能 unattend.xml 已经设置了ExtendOSPartition，不过运行resize没副作用
-    bats="windows-resize.bat windows-set-netconf.bat"
+    bats="windows-set-netconf.bat windows-resize.bat"
     download $confhome/windows-resize.bat $os_dir/windows-resize.bat
     create_win_set_netconf_script $os_dir/windows-set-netconf.bat
 
@@ -1306,6 +1366,17 @@ modify_linux() {
         fi
     }
 
+    # 修复 onlink 网关
+    add_onlink_script_if_need() {
+        if is_staticv4 || is_staticv6; then
+            fix_sh=cloud-init-fix-onlink.sh
+            download $confhome/$fix_sh $os_dir/$fix_sh
+            insert_into_file $ci_file after '^runcmd:' <<EOF
+  - bash /$fix_sh && rm -f /$fix_sh
+EOF
+        fi
+    }
+
     download_cloud_init_config $os_dir
 
     truncate_machine_id $os_dir
@@ -1321,40 +1392,51 @@ modify_linux() {
     # el 全系也用 NetworkManager，但他们的配置文件是 sysconfig，因此不受影响
     # https://github.com/canonical/cloud-init/commit/5d440856cb6d2b4c908015fe4eb7227615c17c8b
     if grep -E 'fedora:38' $os_dir/etc/os-release; then
-        network_manager_py=$os_dir/usr/lib/python3.11/site-packages/cloudinit/net/network_manager.py &&
-            if ! grep '"static6": "manual",' $network_manager_py; then
-                echo '"static6": "manual",' | insert_into_file $network_manager_py after '"static": "manual",'
-            fi
+        network_manager_py=$os_dir/usr/lib/python3.11/site-packages/cloudinit/net/network_manager.py
+        if ! grep '"static6": "manual",' $network_manager_py; then
+            echo '"static6": "manual",' | insert_into_file $network_manager_py after '"static": "manual",'
+        fi
     fi
 
-    # debian 10/11 网络问题
-    if [ -f $os_dir/etc/debian_version ] && grep -E '^(10|11)' $os_dir/etc/debian_version; then
-        mv $os_dir/etc/resolv.conf $os_dir/etc/resolv.conf.orig
-        cp -f /etc/resolv.conf $os_dir/etc/resolv.conf
-        mount_pseudo_fs $os_dir
-        chroot $os_dir apt update
+    # debian 网络问题
+    if [ -f $os_dir/etc/debian_version ]; then
+        # 修复 onlink 网关
+        add_onlink_script_if_need
 
-        if true; then
-            # 将 debian 10/11 设置为 12 一样的网络管理器
-            # 可解决 ifupdown dhcp 不支持 24位掩码+不规则网关的问题
-            chroot $os_dir apt install -y netplan.io
-            chroot $os_dir systemctl disable networking resolvconf
-            chroot $os_dir systemctl enable systemd-networkd systemd-resolved
-            rm -f $os_dir/etc/resolv.conf $os_dir/etc/resolv.conf.orig
-            ln -sf ../run/systemd/resolve/stub-resolv.conf $os_dir/etc/resolv.conf
-            insert_into_file $os_dir/etc/cloud/cloud.cfg.d/99_fallback.cfg after '#cloud-config' <<EOF
+        if grep -E '^(10|11)' $os_dir/etc/debian_version; then
+            mv $os_dir/etc/resolv.conf $os_dir/etc/resolv.conf.orig
+            cp -f /etc/resolv.conf $os_dir/etc/resolv.conf
+            mount_pseudo_fs $os_dir
+            chroot $os_dir apt update
+
+            if true; then
+                # 将 debian 10/11 设置为 12 一样的网络管理器
+                # 可解决 ifupdown dhcp 不支持 24位掩码+不规则网关的问题
+                chroot $os_dir apt install -y netplan.io
+                chroot $os_dir systemctl disable networking resolvconf
+                chroot $os_dir systemctl enable systemd-networkd systemd-resolved
+                rm -f $os_dir/etc/resolv.conf $os_dir/etc/resolv.conf.orig
+                ln -sf ../run/systemd/resolve/stub-resolv.conf $os_dir/etc/resolv.conf
+                insert_into_file $os_dir/etc/cloud/cloud.cfg.d/99_fallback.cfg after '#cloud-config' <<EOF
 system_info:
   network:
     renderers: [netplan]
     activators: [netplan]
 EOF
 
-        else
-            # debian 10/11 默认不支持 rdnss，要安装 rdnssd 或者 nm
-            chroot $os_dir apt install -y rdnssd
-            # 不会自动建立链接，因此不能删除
-            mv $os_dir/etc/resolv.conf.orig $os_dir/etc/resolv.conf
+            else
+                # debian 10/11 默认不支持 rdnss，要安装 rdnssd 或者 nm
+                chroot $os_dir apt install -y rdnssd
+                # 不会自动建立链接，因此不能删除
+                mv $os_dir/etc/resolv.conf.orig $os_dir/etc/resolv.conf
+            fi
         fi
+    fi
+
+    # opensuse leap
+    if grep opensuse-leap $os_dir/etc/os-release; then
+        # 修复 onlink 网关
+        add_onlink_script_if_need
     fi
 
     # opensuse tumbleweed
@@ -1365,6 +1447,10 @@ EOF
 
     # arch
     if [ -f $os_dir/etc/arch-release ]; then
+        # 修复 onlink 网关
+        add_onlink_script_if_need
+
+        # 同步证书
         rm $os_dir/etc/resolv.conf
         cp /etc/resolv.conf $os_dir/etc/resolv.conf
         mount_pseudo_fs $os_dir
@@ -1388,7 +1474,8 @@ EOF
             cp -f /etc/resolv.conf $os_dir/etc/resolv.conf
 
             chroot $os_dir emerge-webrsync
-            profile=$(chroot $os_dir eselect profile list | grep '/[0-9\.]*/systemd (stable)' | awk '{print $2}')
+            profile=$(chroot $os_dir eselect profile list |
+                grep stable | grep systemd | grep -v desktop | tail -1 | awk '{print $2}')
             chroot $os_dir eselect profile set $profile
         fi
 
@@ -1413,6 +1500,9 @@ EOF
         insert_into_file $ci_file after '^runcmd:' <<EOF
   - sed -i '/^Name=/d' /etc/systemd/network/10-cloud-init-eth*.network
 EOF
+
+        # 修复 onlink 网关
+        add_onlink_script_if_need
     fi
 }
 
@@ -1521,6 +1611,30 @@ download_qcow() {
     download $img $qcow_file
 }
 
+connect_qcow() {
+    modprobe nbd nbds_max=1
+    qemu-nbd -c /dev/nbd0 $qcow_file
+
+    # 需要等待一下
+    # https://github.com/canonical/cloud-utils/blob/main/bin/mount-image-callback
+    while ! blkid /dev/nbd0; do
+        echo "Waiting for qcow file to be mounted..."
+        sleep 5
+    done
+}
+
+disconnect_qcow() {
+    if [ -f /sys/block/nbd0/pid ]; then
+        qemu-nbd -d /dev/nbd0
+
+        # 需要等待一下
+        while fuser -sm $qcow_file; do
+            echo "Waiting for qcow file to be unmounted..."
+            sleep 5
+        done
+    fi
+}
+
 install_qcow_el() {
     yum() {
         if [ "$releasever" = 7 ]; then
@@ -1530,8 +1644,7 @@ install_qcow_el() {
         fi
     }
 
-    modprobe nbd nbds_max=1
-    qemu-nbd -c /dev/nbd0 $qcow_file
+    connect_qcow
 
     # TODO: 改成循环mount找出os+fstab查找剩余分区？
     os_part=$(lsblk /dev/nbd0p*[0-9] --sort SIZE -no NAME,FSTYPE | grep xfs | tail -1 | cut -d' ' -f1)
@@ -1582,7 +1695,7 @@ install_qcow_el() {
 
     # 取消挂载 nbd
     umount /nbd/ /nbd-boot/ /nbd-efi/ || true
-    qemu-nbd -d /dev/nbd0
+    disconnect_qcow
 
     # 如果镜像有efi分区，复制其uuid
     # 如果有相同uuid的fat分区，则无法挂载
@@ -1624,7 +1737,7 @@ install_qcow_el() {
 
     # fstab 删除 boot 分区
     # alma/rocky 镜像本身有boot分区，但我们不需要
-    sed -i '/[[:blank:]]\/boot[[:blank:]]/d' /os/etc/fstab
+    sed -i '/[[:space:]]\/boot[[:space:]]/d' /os/etc/fstab
 
     # fstab 添加 efi 分区
     if is_efi; then
@@ -1635,7 +1748,7 @@ install_qcow_el() {
         fi
     else
         # 删除 efi 条目
-        sed -i '/[[:blank:]]\/boot\/efi[[:blank:]]/d' /os/etc/fstab
+        sed -i '/[[:space:]]\/boot\/efi[[:space:]]/d' /os/etc/fstab
     fi
 
     distro_full=$(awk -F: '{ print $3 }' </os/etc/system-release-cpe)
@@ -1706,8 +1819,7 @@ EOF
 
 dd_qcow() {
     if true; then
-        modprobe nbd nbds_max=1
-        qemu-nbd -c /dev/nbd0 $qcow_file
+        connect_qcow
 
         # 检查最后一个分区是否是 btrfs
         # 即使awk结果为空，返回值也是0，加上 grep . 检查是否结果为空
@@ -1732,16 +1844,16 @@ dd_qcow() {
                 # 缩小分区
                 part_start=$(parted /dev/nbd0 -s 'unit b print' | awk "\$1==$part_num {print \$2}" | sed 's/B//')
                 part_size=$(btrfs filesystem usage /mnt/btrfs -b | grep 'Device size:' | awk '{print $3}')
-                part_end=$((part_start + part_size))
+                part_end=$((part_start + part_size - 1))
                 umount /mnt/btrfs
                 printf "yes" | parted /dev/nbd0 resizepart $part_num ${part_end}B ---pretend-input-tty
 
                 # 缩小 qcow2
-                qemu-nbd -d /dev/nbd0
-                qemu-img resize --shrink $qcow_file $part_end
+                disconnect_qcow
+                qemu-img resize --shrink $qcow_file $((part_end + 1))
 
                 # 重新连接
-                qemu-nbd -c /dev/nbd0 $qcow_file
+                connect_qcow
             else
                 umount /mnt/btrfs
             fi
@@ -1773,19 +1885,12 @@ dd_qcow() {
             ;;
         esac
 
-        qemu-nbd -d /dev/nbd0
+        disconnect_qcow
     else
         # 将前1M dd到内存，将1M之后 dd到硬盘
         qemu-img dd if=$qcow_file of=/first-1M bs=1M count=1
         qemu-img dd if=$qcow_file of=/dev/disk/by-label/os bs=1M skip=1
     fi
-
-    # 需要等待一下，不然会出现
-    # umount: /installer/: target is busy.
-    while fuser -sm /installer/; do
-        echo "Waiting for /installer/ to be unmounted..."
-        sleep 5
-    done
 
     # 将前1M从内存 dd 到硬盘
     umount /installer/
@@ -1794,15 +1899,17 @@ dd_qcow() {
 
 }
 
+fix_partition_table_by_parted() {
+    parted /dev/$xda -f -s print
+}
+
 resize_after_install_cloud_image() {
     # 提前扩容
     # 1 修复 vultr 512m debian 10/11 generic/genericcloud 首次启动 kernel panic
     # 2 修复 gentoo websync 时空间不足
     if [ "$distro" = debian ] || [ "$distro" = gentoo ]; then
         apk add parted
-        if parted /dev/$xda -s print 2>&1 | grep 'Not all of the space'; then
-            printf "fix" | parted /dev/$xda print ---pretend-input-tty
-
+        if fix_partition_table_by_parted 2>&1 | grep -q 'Fixing'; then
             system_part_num=$(parted /dev/$xda -m print | tail -1 | cut -d: -f1)
             printf "yes" | parted /dev/$xda resizepart $system_part_num 100% ---pretend-input-tty
             update_part /dev/$xda
@@ -1889,10 +1996,37 @@ EOF
     unix2dos $target
 }
 
-install_windows() {
-    apk add wimlib virt-what dmidecode pev
+# virt-what 要用最新版
+# vultr 1G High Frequency LAX 实际上是 kvm
+# debian 11 virt-what 1.19 显示为 hyperv qemu
+# debian 11 systemd-detect-virt 显示为 microsoft
+# alpine virt-what 1.25 显示为 kvm
+# 所以不要在原系统上判断具体虚拟化环境
 
-    # shellcheck disable=SC2154
+# lscpu 也可查看虚拟化环境，但 alpine on lightsail 运行结果为 Microsoft
+# 猜测 lscpu 只参考了 cpuid 没参考 dmi
+# virt-what 可能会输出多行结果，因此用 grep
+is_virt_contains() {
+    if [ -z "$_virt" ]; then
+        apk add virt-what
+        _virt=$(virt-what)
+        apk del virt-what
+    fi
+    echo "$_virt" | grep -Eiw "$1"
+}
+
+is_dmi_contains() {
+    if [ -z "$_dmi" ]; then
+        apk add dmidecode
+        _dmi=$(dmidecode)
+        apk del dmidecode
+    fi
+    echo "$_dmi" | grep -Eiw "$1"
+}
+
+install_windows() {
+    apk add wimlib pev
+
     download $iso /os/windows.iso
     mkdir -p /iso
     mount -o ro /os/windows.iso /iso
@@ -1933,10 +2067,10 @@ install_windows() {
     image_count=$(wiminfo $install_wim | grep "Image Count:" | cut -d: -f2 | xargs)
     if [ "$image_count" = 1 ]; then
         # 只有一个版本就使用第一个版本
-        image_name=$(wiminfo $install_wim | grep -ix "Name:[[:blank:]]*.*" | cut -d: -f2 | xargs)
+        image_name=$(wiminfo $install_wim | grep -ix "Name:[[:space:]]*.*" | cut -d: -f2 | xargs)
     else
         # 否则改成正确的大小写
-        image_name=$(wiminfo $install_wim | grep -ix "Name:[[:blank:]]*$image_name" | cut -d: -f2 | xargs)
+        image_name=$(wiminfo $install_wim | grep -ix "Name:[[:space:]]*$image_name" | cut -d: -f2 | xargs)
     fi
     echo "Image Name: $image_name"
 
@@ -1951,51 +2085,41 @@ install_windows() {
     fi
 
     # 变量名     使用场景
-    # arch_uname arch命令/uname -m             x86_64  aarch64
-    # arch_wim   wiminfo                  x86  x86_64  ARM64
-    # arch       virtio驱动/unattend.xml  x86  amd64   arm64
-    # arch_xen   xen驱动                  x86  x64
+    # arch_uname arch命令 / uname -m             x86_64  aarch64
+    # arch_wim   wiminfo                    x86  x86_64  ARM64
+    # arch       virtio iso / unattend.xml  x86  amd64   arm64
+    # arch_xdd   virtio msi / xen驱动       x86  x64
 
     # 将 wim 的 arch 转为驱动和应答文件的 arch
     arch_wim=$(wiminfo $install_wim 1 | grep Architecture: | awk '{print $2}' | to_lower)
     case "$arch_wim" in
     x86)
         arch=x86
-        arch_xen=x86
+        arch_xdd=x86
         ;;
     x86_64)
         arch=amd64
-        arch_xen=x64
+        arch_xdd=x64
         ;;
     arm64)
         arch=arm64
-        arch_xen= # xen 没有 arm64 驱动
+        arch_xdd= # xen 没有 arm64 驱动，# virtio 也没有 arm64 msi
         ;;
     esac
 
-    # virt-what 要用最新版
-    # vultr 1G High Frequency LAX 实际上是 kvm
-    # debian 11 virt-what 1.19 显示为 hyperv qemu
-    # debian 11 systemd-detect-virt 显示为 microsoft
-    # alpine virt-what 1.25 显示为 kvm
-    # 所以不要在原系统上判断具体虚拟化环境
-
-    # lscpu 也可查看虚拟化环境，但 alpine on lightsail 运行结果为 Microsoft
-    # 猜测 lscpu 只参考了 cpuid 没参考 dmi
-    # 下载 virtio 驱动
-    # virt-what 可能会输出多行结果，因此用 grep
+    # 驱动
     drv=/os/drivers
     mkdir -p $drv
-    if virt-what | grep aws &&
-        virt-what | grep kvm &&
-        [ "$arch_wim" = x86_64 ]; then
-        # aws nitro
-        # 只有 x64 位驱动
-        # 可能不支持 vista
-        # 未打补丁的 win7 无法使用 sha256 签名的驱动
-        # https://docs.aws.amazon.com/zh_cn/AWSEC2/latest/WindowsGuide/aws-nvme-drivers.html
-        # https://docs.aws.amazon.com/zh_cn/AWSEC2/latest/WindowsGuide/enhanced-networking-ena.html
 
+    # aws nitro
+    # 可能不支持 vista
+    # https://docs.aws.amazon.com/zh_cn/AWSEC2/latest/WindowsGuide/aws-nvme-drivers.html
+    # https://docs.aws.amazon.com/zh_cn/AWSEC2/latest/WindowsGuide/enhanced-networking-ena.html
+    if is_virt_contains aws &&
+        is_virt_contains kvm &&
+        [ "$arch_wim" = x86_64 ]; then
+
+        # 未打补丁的 win7 无法使用 sha256 签名的驱动
         nvme_ver=$(
             case "$nt_ver" in
             6.0 | 6.1) echo 1.3.2 ;; # sha1 签名
@@ -2017,13 +2141,14 @@ install_windows() {
 
         unzip -o -d $drv/aws/ $drv/AWSNVMe.zip
         unzip -o -d $drv/aws/ $drv/AwsEnaNetworkDriver.zip
+    fi
 
-    elif virt-what | grep xen &&
+    # aws xen
+    # 可能不支持 vista
+    # https://docs.aws.amazon.com/zh_cn/AWSEC2/latest/WindowsGuide/xen-drivers-overview.html
+    if is_virt_contains xen &&
         [ "$arch_wim" = x86_64 ]; then
-        # aws xen
-        # 只有 64 位驱动
-        # 可能不支持 vista
-        # https://docs.aws.amazon.com/zh_cn/AWSEC2/latest/WindowsGuide/xen-drivers-overview.html
+
         apk add msitools
 
         aws_pv_ver=$(
@@ -2040,27 +2165,31 @@ install_windows() {
         msiextract $drv/AWSPVDriverSetup.msi -C $drv
         mkdir -p $drv/aws/
         cp -rf $drv/.Drivers/* $drv/aws/
+    fi
 
-    elif false && virt-what | grep xen &&
-        [ "$arch_wim" != arm64 ]; then
-        # xen
-        # 有 x86 x64，没arm64驱动
-        # 没签名，暂时用aws的驱动代替
-        # https://lore.kernel.org/xen-devel/E1qKMmq-00035B-SS@xenbits.xenproject.org/
-        # https://xenbits.xenproject.org/pvdrivers/win/
-        # 在 aws t2 上测试，安装 xenbus 会蓝屏，装了其他7个驱动后，能进系统但没网络
-        # 但 aws 应该用aws官方xen驱动，所以测试仅供参考
+    # xen
+    # 没签名，暂时用aws的驱动代替
+    # https://lore.kernel.org/xen-devel/E1qKMmq-00035B-SS@xenbits.xenproject.org/
+    # https://xenbits.xenproject.org/pvdrivers/win/
+    # 在 aws t2 上测试，安装 xenbus 会蓝屏，装了其他7个驱动后，能进系统但没网络
+    # 但 aws 应该用aws官方xen驱动，所以测试仅供参考
+    if false &&
+        is_virt_contains xen &&
+        { [ "$arch_wim" = x86 ] || [ "$arch_wim" = x86_64 ]; }; then
+
         parts='xenbus xencons xenhid xeniface xennet xenvbd xenvif xenvkbd'
         mkdir -p $drv/xen/
         for part in $parts; do
             download https://xenbits.xenproject.org/pvdrivers/win/$part.tar $drv/$part.tar
             tar -xf $drv/$part.tar -C $drv/xen/
         done
+    fi
 
-    elif virt-what | grep kvm; then
-        # virtio
-        # x86 x64 arm64 都有
-        # https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/
+    # kvm (排除 aws)
+    # x86 x86_64 arm64 都有
+    # https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/
+    if is_virt_contains kvm &&
+        ! is_virt_contains aws; then
 
         # 没有 vista 文件夹
         case "$nt_ver" in
@@ -2074,37 +2203,98 @@ install_windows() {
         # https://github.com/virtio-win/virtio-win-pkg-scripts/issues/40
         # https://github.com/virtio-win/virtio-win-pkg-scripts/issues/61
         case "$nt_ver" in
-        6.0 | 6.1) dir=archive-virtio/virtio-win-0.1.173-9 ;; # vista | w7 | 2k8 | 2k8R2
-        6.2 | 6.3) dir=archive-virtio/virtio-win-0.1.215-1 ;; # win8 | w8.1 | 2k12 | 2k12R2
+        6.0 | 6.1) dir=archive-virtio/virtio-win-0.1.173-9 ;; # vista|w7|2k8|2k8R2
+        6.2 | 6.3) dir=archive-virtio/virtio-win-0.1.215-1 ;; # w8|w8.1|2k12|2k12R2
         *) dir=stable-virtio ;;
         esac
 
-        download https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/$dir/virtio-win.iso $drv/virtio-win.iso
-        mkdir -p $drv/virtio
-        mount -o ro $drv/virtio-win.iso $drv/virtio
-
-        apk add dmidecode
-        dmi=$(dmidecode)
-
-        if echo "$dmi" | grep -Eiw "Google Compute Engine|GoogleCloud"; then
-            gce_repo=https://packages.cloud.google.com/yuck
-            download $gce_repo/repos/google-compute-engine-stable/index /tmp/gce.json
-            # gga 好像只是用于调节后台vnc分辨率
-            for name in gvnic gga; do
-                mkdir -p $drv/gce/$name
-                link=$(grep -o "/pool/.*-google-compute-engine-driver-$name\.goo" /tmp/gce.json)
-                wget $gce_repo$link -O- | tar -xzf- -C $drv/gce/$name
-            done
-
-            # 没有 win6.0 文件夹
-            sys_gce=win$nt_ver
+        # vista|w7|2k8|2k8R2|arm64 要从 iso 获取驱动
+        if [ "$nt_ver" = 6.0 ] || [ "$nt_ver" = 6.1 ] || [ "$arch_wim" = arm64 ]; then
+            virtio_source=iso
+        else
+            virtio_source=msi
         fi
 
-    elif [ "$(dmidecode -s chassis-asset-tag)" = "7783-7084-3265-9085-8269-3286-77" ] &&
-        [ "$arch_wim" != arm64 ]; then
-        # azure
-        # 有 x86 x64，没 arm64
-        # https://learn.microsoft.com/azure/virtual-network/accelerated-networking-mana-windows
+        baseurl=https://fedorapeople.org/groups/virt/virtio-win/direct-downloads
+
+        if [ "$virtio_source" = iso ]; then
+            download $baseurl/$dir/virtio-win.iso $drv/virtio.iso
+            mkdir -p $drv/virtio
+            mount -o ro $drv/virtio.iso $drv/virtio
+        else
+            # coreutils 的 cp mv rm 才有 -v 参数
+            apk add 7zip file coreutils
+            download $baseurl/$dir/virtio-win-gt-$arch_xdd.msi $drv/virtio.msi
+            match="FILE_*_${sys}_${arch}*"
+            7z x $drv/virtio.msi -o$drv/virtio -i!$match -y -bb1
+
+            (
+                cd $drv/virtio
+                # 为没有后缀名的文件添加后缀名
+                echo "Recognizing file extension..."
+                for file in *"${sys}_${arch}"; do
+                    recognized=false
+                    maybe_exts=$(file -b --extension "$file")
+
+                    # exe/sys -> sys
+                    # exe/com -> exe
+                    # dll/cpl/tlb/ocx/acm/ax/ime -> dll
+                    for ext in sys exe dll; do
+                        if echo $maybe_exts | grep -qw $ext; then
+                            recognized=true
+                            mv -v "$file" "$file.$ext"
+                            break
+                        fi
+                    done
+
+                    # 如果识别不了后缀名，就删除此文件
+                    # 因为用不了，免得占用空间
+                    if ! $recognized; then
+                        rm -fv "$file"
+                    fi
+                done
+
+                # 将
+                # FILE_netkvm_netkvmco_w8.1_amd64.dll
+                # FILE_netkvm_w8.1_amd64.cat
+                # 改名为
+                # netkvmco.dll
+                # netkvm.cat
+                echo "Renaming files..."
+                for file in *; do
+                    new_file=$(echo "$file" | sed "s|FILE_||; s|_${sys}_${arch}||; s|.*_||")
+                    mv -v "$file" "$new_file"
+                done
+            )
+        fi
+    fi
+
+    # gcp
+    if { is_dmi_contains "Google Compute Engine" || is_dmi_contains "GoogleCloud"; } &&
+        { [ "$arch_wim" = x86 ] || [ "$arch_wim" = x86_64 ]; }; then
+
+        gce_repo=https://packages.cloud.google.com/yuck
+        download $gce_repo/repos/google-compute-engine-stable/index /tmp/gce.json
+        # gga 好像只是用于调节后台vnc分辨率
+        for name in gvnic gga; do
+            mkdir -p $drv/gce/$name
+            link=$(grep -o "/pool/.*-google-compute-engine-driver-$name\.goo" /tmp/gce.json)
+            wget $gce_repo$link -O- | tar -xzf- -C $drv/gce/$name
+
+            # 没有 win6.0 文件夹
+            # TODO: 测试是否可用
+            if false; then
+                mkdir -p $drv/gce/$name/win6.0/
+                cp -r $drv/gce/$name/win6.1/* $drv/gce/$name/win6.0/
+            fi
+        done
+    fi
+
+    # azure
+    # https://learn.microsoft.com/azure/virtual-network/accelerated-networking-mana-windows
+    if is_dmi_contains "7783-7084-3265-9085-8269-3286-77" &&
+        { [ "$arch_wim" = x86 ] || [ "$arch_wim" = x86_64 ]; }; then
+
         download https://aka.ms/manawindowsdrivers $drv/azure.zip
         unzip $drv/azure.zip -d $drv/azure/
     fi
@@ -2157,20 +2347,28 @@ install_windows() {
     # 添加驱动
     mkdir -p /wim/drivers
     [ -d $drv/virtio ] && {
-        if [ "$nt_ver" = 6.0 ]; then
-            # 气球驱动有问题
-            cp_drivers $drv/virtio -ipath "*/$sys/$arch/*" -not -ipath "*/balloon/*"
+        if [ "$virtio_source" = iso ]; then
+            # iso
+            if [ "$nt_ver" = 6.0 ]; then
+                # win7 气球驱动有问题
+                cp_drivers $drv/virtio -ipath "*/$sys/$arch/*" -not -ipath "*/balloon/*"
+            else
+                cp_drivers $drv/virtio -ipath "*/$sys/$arch/*"
+            fi
         else
-            cp_drivers $drv/virtio -ipath "*/$sys/$arch/*"
+            # msi
+            # 虽然 win7 气球驱动有问题，但 msi 里面没有 win7 驱动
+            # 因此不用额外处理
+            cp_drivers $drv/virtio
         fi
     }
     [ -d $drv/aws ] && cp_drivers $drv/aws
-    [ -d $drv/xen ] && cp_drivers $drv/xen -ipath "*/$arch_xen/*"
+    [ -d $drv/xen ] && cp_drivers $drv/xen -ipath "*/$arch_xdd/*"
     [ -d $drv/azure ] && cp_drivers $drv/azure
     [ -d $drv/gce ] && {
         [ "$arch_wim" = x86 ] && gvnic_suffix=-32 || gvnic_suffix=
-        cp_drivers $drv/gce/gvnic -ipath "*/$sys_gce$gvnic_suffix/*"
-        cp_drivers $drv/gce/gga -ipath "*/$sys_gce/*"
+        cp_drivers $drv/gce/gvnic -ipath "*/win$nt_ver$gvnic_suffix/*"
+        cp_drivers $drv/gce/gga -ipath "*/win$nt_ver/*"
     }
 
     # win7 要添加 bootx64.efi 到 efi 目录
@@ -2248,9 +2446,13 @@ download_netboot_xyz_efi() {
 }
 
 refind_main_disk() {
-    apk add sfdisk
-    main_disk="$(sfdisk --disk-id "/dev/$xda" | sed 's/0x//')"
-    apk del sfdisk
+    if true; then
+        apk add sfdisk
+        main_disk=$(sfdisk --disk-id /dev/$xda | sed 's/0x//')
+    else
+        apk add lsblk
+        main_disk=$(lsblk --nodeps -rno PTUUID /dev/$xda)
+    fi
 }
 
 install_redhat_ubuntu() {
@@ -2287,18 +2489,16 @@ install_redhat_ubuntu() {
     if [ "$distro" = "ubuntu" ]; then
         download $iso /os/installer/ubuntu.iso
 
-        apk add dmidecode
-        dmi=$(dmidecode)
         # https://github.com/systemd/systemd/blob/main/src/basic/virt.c
         # https://github.com/canonical/cloud-init/blob/main/tools/ds-identify
         # http://git.annexia.org/?p=virt-what.git;a=blob;f=virt-what.in;hb=HEAD
-        if echo "$dmi" | grep -Eiw "amazon|ec2"; then
+        if is_dmi_contains "amazon" || is_dmi_contains "ec2"; then
             kernel=aws
-        elif echo "$dmi" | grep -Eiw "Google Compute Engine|GoogleCloud"; then
+        elif is_dmi_contains "Google Compute Engine" || is_dmi_contains "GoogleCloud"; then
             kernel=gcp
-        elif echo "$dmi" | grep -Eiw "OracleCloud"; then
+        elif is_dmi_contains "OracleCloud"; then
             kernel=oracle
-        elif echo "$dmi" | grep -Eiw "7783-7084-3265-9085-8269-3286-77"; then
+        elif is_dmi_contains "7783-7084-3265-9085-8269-3286-77"; then
             kernel=azure
         else
             kernel=generic
@@ -2338,6 +2538,10 @@ EOF
 }
 
 # 脚本入口
+# debian initrd 会寻找 main
+# 并调用本文件的 create_ifupdown_config 方法
+: main
+
 # arm要手动从硬件同步时间，避免访问https出错
 # do 机器第二次运行会报错
 hwclock -s || true
@@ -2359,7 +2563,11 @@ clear_previous
 add_community_repo
 
 # 需要在重新分区之前，找到主硬盘
-find_xda
+# 重新运行脚本时，可指定 xda
+# xda=sda ash trans.start
+if [ -z "$xda" ]; then
+    find_xda
+fi
 
 if [ "$distro" != "alpine" ]; then
     setup_nginx_if_enough_ram
@@ -2412,6 +2620,7 @@ if is_efi && [ "$distro" != "alpine" ]; then
     add_fallback_efi_to_nvram
 fi
 
+sync
 echo 'done'
 if [ "$hold" = 2 ]; then
     exit

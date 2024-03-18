@@ -35,7 +35,7 @@ Usage: reinstall.sh centos   7|8|9
                     windows  --iso=http://xxx --image-name='windows xxx'
                     netboot.xyz
 
-Homepage: https://github.com/bin456789/reinstall
+Manual: https://github.com/bin456789/reinstall
 EOF
     exit 1
 }
@@ -68,15 +68,27 @@ error_and_exit() {
 curl() {
     # 添加 -f, --fail，不然 404 退出码也为0
     # 32位 cygwin 已停止更新，证书可能有问题，先添加 --insecure
+    # centos 7 curl 不支持 --retry-connrefused --retry-all-errors
+    # 因此手动 retry
     grep -o 'http[^ ]*' <<<"$@" >&2
-    command curl --insecure --connect-timeout 10 --retry 5 --retry-delay 1 -f "$@"
+    for i in $(seq 5); do
+        if command curl --insecure --connect-timeout 10 -f "$@"; then
+            return
+        else
+            ret=$?
+            if [ $ret -eq 22 ]; then
+                # 403 404 错误
+                return $ret
+            fi
+        fi
+        sleep 1
+    done
 }
 
 is_in_china() {
     if [ -z $_is_in_china ]; then
-        # https://geoip.fedoraproject.org/city # 不支持 ipv6
-        # https://geoip.ubuntu.com/lookup # 不支持 ipv6
-        curl -L http://www.cloudflare.com/cdn-cgi/trace |
+        # 部分地区 www.cloudflare.com 被墙
+        curl -L http://dash.cloudflare.com/cdn-cgi/trace |
             grep -qx 'loc=CN' && _is_in_china=true ||
             _is_in_china=false
     fi
@@ -100,7 +112,7 @@ is_use_dd() {
 }
 
 is_os_in_btrfs() {
-    mount | grep -w 'on / type btrfs'
+    mount | grep -qw 'on / type btrfs'
 }
 
 is_os_in_subvol() {
@@ -198,12 +210,23 @@ test_url_real() {
     # 用 dd 限制下载 1M
     # 并过滤 curl 23 错误（dd限制了空间）
     # 也可用 ulimit -f 但好像 cygwin 不支持
-    curl -Lr 0-1048575 "$url" \
-        1> >(dd bs=1M count=1 of=$tmp_file iflag=fullblock 2>/dev/null) \
-        2> >(grep -v 'curl: (23)' >&2) ||
-        if [ ! $? -eq 23 ]; then
-            failed "$url not accessible"
+    echo $url
+    for i in $(seq 5 -1 0); do
+        if command curl --insecure --connect-timeout 10 -Lfr 0-1048575 "$url" \
+            1> >(dd bs=1M count=1 of=$tmp_file iflag=fullblock 2>/dev/null) \
+            2> >(grep -v 'curl: (23)' >&2); then
+            break
+        else
+            ret=$?
+            msg="$url not accessible"
+            case $ret in
+            22) failed "$msg" ;;                # 403 404
+            23) break ;;                        # 限制了空间
+            *) [ $i -eq 0 ] && failed "$msg" ;; # 其他错误
+            esac
+            sleep 1
         fi
+    done
 
     if [ -n "$expect_type" ]; then
         # gzip的mime有很多种写法
@@ -244,11 +267,11 @@ assert_not_in_container() {
     is_in_windows && return
 
     if is_have_cmd systemd-detect-virt; then
-        if systemd-detect-virt -c >/dev/null; then
+        if systemd-detect-virt -qc; then
             _error_and_exit
         fi
     else
-        if [ -d /proc/vz ] || grep container=lxc /proc/1/environ; then
+        if [ -d /proc/vz ] || grep -q container=lxc /proc/1/environ; then
             _error_and_exit
         fi
     fi
@@ -377,7 +400,6 @@ setos() {
             [ "$releasever" -eq 10 ] && [ "$basearch_alt" = amd64 ] && flavour=
             # shellcheck disable=SC2034
             kernel=linux-image$flavour-$basearch_alt
-
         fi
     }
 
@@ -448,6 +470,7 @@ setos() {
         if is_in_china; then
             ci_mirror=https://mirrors.tuna.tsinghua.edu.cn/gentoo
         else
+            # ci_mirror=https://mirror.leaseweb.com/gentoo  # 不支持 ipv6
             ci_mirror=https://distfiles.gentoo.org
         fi
 
@@ -725,7 +748,11 @@ install_pkg() {
     }
 
     install_pkg_real() {
-        echo "Installing package '$pkg' for command '$cmd'..."
+        text="$pkg"
+        if [ "$pkg" != "$cmd" ]; then
+            text+=" ($cmd)"
+        fi
+        echo "Installing package '$text'..."
         case $pkg_mgr in
         dnf) dnf install -y --setopt=install_weak_deps=False $pkg ;;
         yum) yum install -y $pkg ;;
@@ -841,7 +868,7 @@ is_efi() {
 is_secure_boot_enabled() {
     if is_efi; then
         if is_in_windows; then
-            reg query 'HKLM\SYSTEM\CurrentControlSet\Control\SecureBoot\State' /v UEFISecureBootEnabled | grep 0x1
+            reg query 'HKLM\SYSTEM\CurrentControlSet\Control\SecureBoot\State' /v UEFISecureBootEnabled 2>/dev/null | grep 0x1
         else
             # localhost:~# mokutil --sb-state
             # SecureBoot disabled
@@ -872,6 +899,10 @@ to_lower() {
 
 del_cr() {
     sed 's/\r//g'
+}
+
+del_empty_lines() {
+    sed '/^[[:space:]]*$/d'
 }
 
 # 记录主硬盘
@@ -912,7 +943,9 @@ find_main_disk() {
 
         # 可以用 dd 找出 guid?
 
+        # centos7 blkid lsblk 不显示 PTUUID
         # centos7 sfdisk 不显示 Disk identifier
+        # alpine blkid 不显示 gpt 分区表的 PTUUID
         # 因此用 fdisk
 
         # Disk identifier: 0x36778223                                  # gnu fdisk + mbr
@@ -978,7 +1011,7 @@ collect_netconf() {
             done
 
             # IPv6
-            ipv6_type_list=$(cmd /c "chcp 437 & netsh interface ipv6 show address $id normal")
+            ipv6_type_list=$(netsh interface ipv6 show address $id normal)
             for ((i = 0; i < ${#ips[@]}; i++)); do
                 ip=${ips[i]}
                 cidr=${subnets[i]}
@@ -1310,7 +1343,18 @@ build_nextos_cmdline() {
         nextos_cmdline="root=live:$nextos_squashfs inst.ks=$nextos_ks"
     fi
 
-    nextos_cmdline+=" $(echo_tmp_ttys)"
+    if [ $nextos_distro = debian ]; then
+        if [ "$basearch" = "x86_64" ]; then
+            # debian 不遵循最后一个 tty 为主 tty 的规则
+            # 设置ttyS0,tty0,最终结果是ttyS0
+            :
+        else
+            # debian arm 不设置 tty 无法启动
+            nextos_cmdline+=" $(echo_tmp_ttys)"
+        fi
+    else
+        nextos_cmdline+=" $(echo_tmp_ttys)"
+    fi
     # nextos_cmdline+=" mem=256M"
 }
 
@@ -1347,22 +1391,103 @@ mkdir_clear() {
     mkdir -p $dir
 }
 
-mod_alpine_initrd() {
-    # 修改 alpine 启动时运行我们的脚本
-    info mod alpine initrd
-    install_pkg gzip cpio
+mod_initrd_debian() {
+    # hack 1
+    # 允许设置 ipv4 onlink 网关
+    sed -Ei 's,&&( onlink=),||\1,' etc/udhcpc/default.script
 
-    # 解压
-    # 先删除临时文件，避免之前运行中断有残留文件
-    tmp_dir=/tmp/reinstall
-    mkdir_clear $tmp_dir
-    cd $tmp_dir
-    zcat /reinstall-initrd | cpio -idm
+    # hack 2
+    # 修改 /var/lib/dpkg/info/netcfg.postinst 运行我们的脚本
+    # shellcheck disable=SC1091,SC2317
+    netcfg() {
+        #!/bin/sh
+        . /usr/share/debconf/confmodule
+        db_progress START 0 5 debian-installer/netcfg/title
 
-    # 预先下载脚本
-    curl -Lo $tmp_dir/trans.start $confhome/trans.sh
-    curl -Lo $tmp_dir/alpine-network.sh $confhome/alpine-network.sh
+        # 找到主网卡
+        # debian 11 initrd 没有 awk
+        if false; then
+            iface=$(ip -o link | grep "@mac_addr" | awk '{print $2}' | cut -d: -f1)
+        else
+            iface=$(ip -o link | grep "@mac_addr" | cut -d' ' -f2 | cut -d: -f1)
+        fi
+        db_progress STEP 1
 
+        # dhcpv4
+        db_progress INFO netcfg/dhcp_progress
+        udhcpc -i "$iface" -f -q -n
+        db_progress STEP 1
+
+        # slaac + dhcpv6
+        db_progress INFO netcfg/slaac_wait_title
+        # https://salsa.debian.org/installer-team/netcfg/-/blob/master/autoconfig.c#L148
+        cat <<EOF >/var/lib/netcfg/dhcp6c.conf
+interface $iface {
+    send ia-na 0;
+    request domain-name-servers;
+    request domain-name;
+    script "/lib/netcfg/print-dhcp6c-info";
+};
+
+id-assoc na 0 {
+};
+EOF
+        dhcp6c -c /var/lib/netcfg/dhcp6c.conf "$iface"
+        sleep 10
+        kill -9 "$(cat /var/run/dhcp6c.pid)"
+        db_progress STEP 1
+
+        # 静态 + 检测网络
+        db_subst netcfg/link_detect_progress interface "$iface"
+        db_progress INFO netcfg/link_detect_progress
+        . /alpine-network.sh @netconf
+        db_progress STEP 1
+
+        # 运行trans.sh，保存配置
+        db_progress INFO base-installer/progress/netcfg
+        . /trans.sh
+        db_progress STEP 1
+    }
+
+    collect_netconf
+    is_in_china && is_in_china=true || is_in_china=false
+    netconf="'$mac_addr' '$ipv4_addr' '$ipv4_gateway' '$ipv6_addr' '$ipv6_gateway' '$is_in_china'"
+
+    get_function_content netcfg |
+        sed "s|@mac_addr|$mac_addr|" |
+        sed "s|@netconf|$netconf|" >var/lib/dpkg/info/netcfg.postinst
+
+    # hack 3
+    # 修改 trans.sh
+    # 1. 直接调用 create_ifupdown_config
+    insert_into_file $tmp_dir/trans.sh after ': main' <<EOF
+        distro=debian
+        create_ifupdown_config /etc/network/interfaces
+        exit
+EOF
+    # 2. 删除 debian busybox 无法识别的语法
+    # 3. 删除 apk 语句
+    # 4. debian 11/12 initrd 无法识别 > >
+    # 5. debian 11/12 initrd 无法识别 < <
+    # 6. debian 11 initrd 无法识别 set -E
+    # 7. debian 11 initrd 无法识别 trap ERR
+    # 删除或注释，可能会导致空方法而报错，因此改为替换成'\n: #'
+    replace='\n: #'
+    sed -Ei "s/> >/$replace/" $tmp_dir/trans.sh
+    sed -Ei "s/< </$replace/" $tmp_dir/trans.sh
+    sed -Ei "s/(^[[:space:]]*set[[:space:]].*)E/\1/" $tmp_dir/trans.sh
+    sed -Ei "s/^[[:space:]]*apk[[:space:]]/$replace/" $tmp_dir/trans.sh
+    sed -Ei "s/^[[:space:]]*trap[[:space:]]/$replace/" $tmp_dir/trans.sh
+
+    # cygwin 无法删除 initrd 里面的 /dev/console /dev/null
+    # 重新打包 initrd 也会提示 cpio: ./dev/console: Cannot stat: Bad address
+    # 删除后没有副作用
+    for file in console null; do
+        mv "dev/$file" "$(mktemp -u)"
+    done
+}
+
+mod_initrd_alpine() {
     # virt 内核添加 ipv6 模块
     if virt_dir=$(ls -d $tmp_dir/lib/modules/*-virt 2>/dev/null); then
         ipv6_dir=$virt_dir/kernel/net/ipv6
@@ -1389,13 +1514,14 @@ EOF
 
     # hack 2 设置 ethx
     # 3.16~3.18 ip_choose_if
-    # 3.19.1+ ethernets
+    # 3.19 ethernets
     if grep -q ip_choose_if init; then
         ethernets_func=ip_choose_if
     else
         ethernets_func=ethernets
     fi
 
+    # shellcheck disable=SC2317
     ip_choose_if() {
         ip -o link | grep "@mac_addr" | awk '{print $2}' | cut -d: -f1
         return
@@ -1410,7 +1536,7 @@ EOF
     # 使用同样参数运行 udhcpc6
     #       udhcpc -i "$device" -f -q # v3.17
     # $MOCK udhcpc -i "$device" -f -q # v3.18
-    # $MOCK udhcpc -i "$iface" -f -q  # v3.19.1
+    # $MOCK udhcpc -i "$iface" -f -q  # v3.19
     search='udhcpc -i'
     orig_cmd="$(grep "$search" init)"
     mod_cmd4="$orig_cmd -n || true"
@@ -1423,12 +1549,13 @@ EOF
     # udhcpc:  bound
     # udhcpc6: deconfig
     # udhcpc6: bound
-    # shellcheck disable=SC2154
+    # shellcheck disable=SC2317
     udhcpc() {
         if [ "$1" = deconfig ]; then
             return
         fi
         if [ "$1" = bound ] && [ -n "$ipv6" ]; then
+            # shellcheck disable=SC2154
             ip -6 addr add "$ipv6" dev "$interface"
             ip link set dev "$interface" up
             return
@@ -1444,7 +1571,7 @@ EOF
     # hack 5 网络配置
     is_in_china && is_in_china=true || is_in_china=false
     insert_into_file init after 'MAC_ADDRESS=' <<EOF
-        source /alpine-network.sh \
+        . /alpine-network.sh \
         "$mac_addr" "$ipv4_addr" "$ipv4_gateway" "$ipv6_addr" "$ipv6_gateway" "$is_in_china"
 EOF
 
@@ -1460,10 +1587,27 @@ EOF
     insert_into_file init before '^exec (/bin/busybox )?switch_root' <<EOF
         # echo "wget --no-check-certificate -O- $confhome/trans.sh | /bin/ash" >\$sysroot/etc/local.d/trans.start
         # wget --no-check-certificate -O \$sysroot/etc/local.d/trans.start $confhome/trans.sh
-        cp /trans.start \$sysroot/etc/local.d/trans.start
+        cp /trans.sh \$sysroot/etc/local.d/trans.start
         chmod a+x \$sysroot/etc/local.d/trans.start
         ln -s /etc/init.d/local \$sysroot/etc/runlevels/default/
 EOF
+}
+
+mod_initrd() {
+    info "mod $nextos_distro initrd"
+    install_pkg gzip cpio
+
+    # 解压
+    # 先删除临时文件，避免之前运行中断有残留文件
+    tmp_dir=/tmp/reinstall
+    mkdir_clear $tmp_dir
+    cd $tmp_dir
+    zcat /reinstall-initrd | cpio -idm
+
+    curl -Lo $tmp_dir/trans.sh $confhome/trans.sh
+    curl -Lo $tmp_dir/alpine-network.sh $confhome/alpine-network.sh
+
+    mod_initrd_$nextos_distro
 
     # 重建
     # 注意要用 cpio -H newc 不要用 cpio -c ，不同版本的 -c 作用不一样，很坑
@@ -1476,9 +1620,25 @@ EOF
 }
 
 # 脚本入口
+if is_in_windows; then
+    # win系统盘
+    c=$(echo $SYSTEMDRIVE | cut -c1)
+
+    # 64位系统 + 32位cmd/cygwin，需要添加 PATH，否则找不到64位系统程序，例如bcdedit
+    sysnative=$(cygpath -u $WINDIR\\Sysnative)
+    if [ -d $sysnative ]; then
+        PATH=$PATH:$sysnative
+    fi
+
+    # 更改 windows 命令输出语言为英文
+    # chcp.com 437 # 会清屏
+    mode.com con cp select=437 >/dev/null
+fi
+
 # 检查 root
 if is_in_windows; then
-    if ! openfiles >/dev/null 2>&1; then
+    # 64位系统 + 32位cmd/cygwin，运行 openfiles 报错：目标系统必须运行 32 位的操作系统
+    if ! fltmc >/dev/null 2>&1; then
         error_and_exit "Please run as administrator."
     fi
 else
@@ -1545,11 +1705,6 @@ if is_secure_boot_enabled; then
     error_and_exit "Not Supported with secure boot enabled."
 fi
 
-# win系统盘
-if is_in_windows; then
-    c=$(echo $SYSTEMDRIVE | cut -c1)
-fi
-
 # 必备组件
 install_pkg curl grep
 
@@ -1558,9 +1713,12 @@ if ! { [ "$distro" = dd ] || [ "$distro" = windows ] || [ "$distro" = netboot.xy
     check_ram
 fi
 
-# alpine --ci 参数无效
-if [ "$distro" = alpine ] && is_use_cloud_image; then
-    error_and_exit "can't install alpine with cloud image"
+# 以下系统忽略 --ci 参数
+if is_use_cloud_image && {
+    [ "$distro" = dd ] || [ "$distro" = windows ] || [ "$distro" = netboot.xyz ] || [ "$distro" = alpine ]
+}; then
+    echo "ignored --ci"
+    cloud_image=0
 fi
 
 # 检查硬件架构
@@ -1667,13 +1825,13 @@ else
     curl -Lo /reinstall-initrd $nextos_initrd
 fi
 
-# 修改 alpine initrd
-if [ "$nextos_distro" = alpine ]; then
-    mod_alpine_initrd
+# 修改 alpine debian initrd
+if [ "$nextos_distro" = alpine ] || [ "$nextos_distro" = debian ]; then
+    mod_initrd
 fi
 
 # 将内核/netboot.xyz.lkrn 放到正确的位置
-if is_use_grub; then
+if false && is_use_grub; then
     if is_in_windows; then
         cp -f /reinstall-vmlinuz /cygdrive/$c/
         is_have_initrd && cp -f /reinstall-initrd /cygdrive/$c/
@@ -1744,7 +1902,7 @@ if is_use_grub; then
         if [ -d /boot/loader/entries/ ]; then
             entries="/boot/loader/entries/"
         fi
-        if grep -q -r -E '^[[:blank:]]*linuxefi[[:blank:]]' $grub_cfg $entries; then
+        if grep -q -r -E '^[[:space:]]*linuxefi[[:space:]]' $grub_cfg $entries; then
             efi=efi
         fi
     fi
@@ -1770,25 +1928,47 @@ if is_use_grub; then
         target_cfg=$grub_cfg
     fi
 
+    # 找到 /reinstall-vmlinuz /reinstall-initrd 的绝对路径
+    if is_in_windows; then
+        # dir=/cygwin/
+        dir=$(cygpath -m / | cut -d: -f2-)/
+    else
+        # 获取当前系统根目录在 btrfs 中的绝对路径
+        if is_os_in_btrfs; then
+            # btrfs subvolume show /
+            # 输出可能是 / 或 root 或 @/.snapshots/1/snapshot
+            dir=$(btrfs subvolume show / | head -1)
+            if ! [ "$dir" = / ]; then
+                dir="/$dir/"
+            fi
+        else
+            dir=/
+        fi
+    fi
+
+    vmlinuz=${dir}reinstall-vmlinuz
+    initrd=${dir}reinstall-initrd
+
     # 生成 linux initrd 命令
     if is_netboot_xyz; then
-        linux_cmd="linux16 /reinstall-vmlinuz"
+        linux_cmd="linux16 $vmlinuz"
     else
         find_main_disk
         build_cmdline
-        linux_cmd="linux$efi /reinstall-vmlinuz $cmdline"
-        initrd_cmd="initrd$efi /reinstall-initrd"
+        linux_cmd="linux$efi $vmlinuz $cmdline"
+        initrd_cmd="initrd$efi $initrd"
     fi
 
     # 生成 grub 配置
     # 实测 centos 7 lvm 要手动加载 lvm 模块
     echo $target_cfg
-    cat <<EOF | tee $target_cfg
+    cat <<EOF | del_empty_lines | tee $target_cfg
 set timeout=5
 menuentry "$(get_entry_name)" {
-    $(is_in_windows || echo 'insmod lvm')
+    $(! is_in_windows && echo 'insmod lvm')
+    $(is_os_in_btrfs && echo 'set btrfs_relative_path=n')
     insmod all_video
-    search --no-floppy --file --set=root /reinstall-vmlinuz
+    search --no-floppy --file --set=root $vmlinuz
     $linux_cmd
     $initrd_cmd
 }
