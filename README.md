@@ -11,7 +11,7 @@
 ## 亮点
 
 - 使用官方云镜像 (Cloud Image) 安装，可绕过传统网络安装的 [内存要求](https://access.redhat.com/articles/rhel-limits#minimum-required-memory-3)，且安装速度更快
-- 支持 512M + 5G 小鸡，也支持 256M 小鸡安装 Alpine
+- 支持 512M + 5G 小鸡，也支持 256M 小鸡安装 Alpine、Debian
 - 支持所有网络情况，包括动静态 IPv4/IPv6，纯 IPv4/IPv6
 - 支持用官方 iso 安装 Windows
 - 支持 Windows 重装成 Linux，也支持重装 Windows
@@ -33,7 +33,7 @@ curl -O https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh
 国内：
 
 ```bash
-curl -O https://raw.gitmirror.com/bin456789/reinstall/main/reinstall.sh
+curl -O https://mirror.ghproxy.com/https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh
 ```
 
 ## 下载（当前系统是 Windows）
@@ -51,7 +51,7 @@ certutil -urlcache -f -split https://raw.githubusercontent.com/bin456789/reinsta
 国内：
 
 ```batch
-certutil -urlcache -f -split https://raw.gitmirror.com/bin456789/reinstall/main/reinstall.bat
+certutil -urlcache -f -split https://mirror.ghproxy.com/https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.bat
 ```
 
 ## 使用
@@ -63,35 +63,25 @@ certutil -urlcache -f -split https://raw.gitmirror.com/bin456789/reinstall/main/
 
 ### 功能 1: 安装 Linux
 
-- 参数 `--ci` 表示强制使用云镜像安装
-- 静态 IP 的机器安装 CentOS、Alma、Rocky、Fedora、Ubuntu，必须使用 `--ci` 参数
-- 如果不清楚机器是静态 IP 还是动态 IP，也可使用 `--ci`
+- 不输入版本号，则安装最新版
+- 在虚拟机上，会自动安装精简内核
 
 ```bash
 bash reinstall.sh centos   7|8|9  (8|9 为 stream 版本)
                   alma     8|9
                   rocky    8|9
-                  fedora   38|39
+                  fedora   38|39|40
                   debian   10|11|12
-                  ubuntu   20.04|22.04
-                  alpine   3.16|3.17|3.18|3.19
                   opensuse 15.5|tumbleweed
-                  arch     (暂不支持 ARM)
-                  gentoo   (暂不支持 ARM)
-
-                  不输入版本号，则安装最新版
-```
-
-参数:
-
-```bash
---ci              强制使用云镜像
+                  ubuntu   20.04|22.04|24.04
+                  alpine   3.16|3.17|3.18|3.19
+                  arch
+                  gentoo
 ```
 
 ### 功能 2: DD
 
 - 支持 gzip、xz 格式
-
 - 静态 IP 的机器 DD Windows，会自动配置好 IP
 
 ```bash
@@ -101,7 +91,6 @@ bash reinstall.sh dd --img https://example.com/xxx.xz
 ### 功能 3: 重启到 Alpine 救援系统 (Live OS)
 
 - 可用 ssh 连接，进行手动 DD、修改分区、手动安装 Arch / Gentoo 等操作
-
 - 如果没有修改硬盘内容，再次重启将回到原系统
 
 ```bash
@@ -111,6 +100,7 @@ bash reinstall.sh alpine --hold=1
 ### 功能 4: 重启到 netboot.xyz
 
 - 可使用后台 VNC 安装 [更多系统](https://github.com/netbootxyz/netboot.xyz?tab=readme-ov-file#what-operating-systems-are-currently-available-on-netbootxyz)
+- 如果没有修改硬盘内容，再次重启将回到原系统
 
 ```bash
 bash reinstall.sh netboot.xyz
@@ -124,17 +114,25 @@ bash reinstall.sh netboot.xyz
 
 ```bash
 bash reinstall.sh windows \
-     --iso 'https://drive.massgrave.dev/en-us_windows_10_enterprise_ltsc_2021_x64_dvd_d289cf96.iso' \
-     --image-name 'Windows 10 Enterprise LTSC 2021'
+     --image-name 'Windows 10 Enterprise LTSC 2021' \
+     --iso 'https://drive.massgrave.dev/en-us_windows_10_enterprise_ltsc_2021_x64_dvd_d289cf96.iso'
+```
+
+- 现在脚本支持自动查找 Windows (含 LTSC) 和 Windows Server iso 链接
+- 需设置语言 `--lang`，默认 `en-us`
+- 查找源：<https://massgrave.dev/genuine-installation-media.html>
+
+```bash
+bash reinstall.sh windows \
+     --image-name 'Windows 10 Enterprise LTSC 2021' \
+     --lang zh-cn
 ```
 
 ![Installing Windows](https://github.com/bin456789/reinstall/assets/7548515/07c1aea2-1ce3-4967-904f-aaf9d6eec3f7)
 
-参数:
+参数说明:
 
-`--iso` 原版镜像链接
-
-`--image-name` 指定要安装的映像，不区分大小写，例如：
+`--image-name` 指定要安装的映像，不区分大小写，常用映像有：
 
 ```text
 Windows 7 Ultimate
@@ -148,18 +146,18 @@ Windows Server 2022 SERVERDATACENTER
 ![image-name](https://github.com/bin456789/reinstall/assets/7548515/5aae0a9b-61e2-4f66-bb98-d470a6beaac2)
 
 1. 支持的系统：
-    - Windows Vista 到 11
-    - Windows Server 2008 到 2022，包括以下衍生版
-        - Windows Server Essentials
-        - Windows Server Annual Channel
-        - Hyper-V Server
-        - Azure Stack HCI
+   - Windows Vista 到 11
+   - Windows Server 2008 到 2022，包括以下衍生版
+     - Windows Server Essentials
+     - Windows Server Annual Channel
+     - Hyper-V Server
+     - Azure Stack HCI
 2. 脚本会按需安装以下驱动：
-    - KVM ([Virtio](https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/))
-    - XEN ([XEN PV](https://xenproject.org/windows-pv-drivers/)、[AWS PV](https://docs.aws.amazon.com/zh_cn/AWSEC2/latest/WindowsGuide/xen-drivers-overview.html))
-    - AWS ([ENA 网卡](https://docs.aws.amazon.com/zh_cn/AWSEC2/latest/WindowsGuide/enhanced-networking-ena.html)、[NVME 存储控制器](https://docs.aws.amazon.com/zh_cn/AWSEC2/latest/WindowsGuide/aws-nvme-drivers.html))
-    - GCP ([gVNIC 网卡](https://cloud.google.com/compute/docs/networking/using-gvnic)、[GGA 显卡](https://cloud.google.com/compute/docs/instances/enable-instance-virtual-display))
-    - Azure ([MANA 网卡](https://learn.microsoft.com/zh-cn/azure/virtual-network/accelerated-networking-mana-windows))
+   - KVM ([Virtio](https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/))
+   - XEN ([XEN](https://xenproject.org/windows-pv-drivers/)、[Citrix](https://docs.aws.amazon.com/AWSEC2/latest/WindowsGuide/Upgrading_PV_drivers.html#win2008-citrix-upgrade)、[AWS](https://docs.aws.amazon.com/AWSEC2/latest/WindowsGuide/xen-drivers-overview.html))
+   - AWS ([ENA 网卡](https://docs.aws.amazon.com/AWSEC2/latest/WindowsGuide/enhanced-networking-ena.html)、[NVME 存储控制器](https://docs.aws.amazon.com/AWSEC2/latest/WindowsGuide/aws-nvme-drivers.html))
+   - GCP ([gVNIC 网卡](https://cloud.google.com/compute/docs/networking/using-gvnic)、[GGA 显卡](https://cloud.google.com/compute/docs/instances/enable-instance-virtual-display))
+   - Azure ([MANA 网卡](https://learn.microsoft.com/azure/virtual-network/accelerated-networking-mana-windows))
 3. Vista (Server 2008) 和 32 位系统可能会缺少驱动
 4. 未开启 CSM 的 EFI 机器，无法安装 Windows 7 (Server 2008 R2)
 5. 静态 IP 的机器，安装后会自动配置好 IP
@@ -175,6 +173,8 @@ Windows Server 2022 SERVERDATACENTER
 
    <https://massgrave.dev/genuine-installation-media.html> (推荐，iso 来自官方，每月更新，包含最新补丁)
 
+   <https://www.microsoft.com/software-download/windows8>
+
    <https://www.microsoft.com/software-download/windows10> (需用手机 User-Agent 打开)
 
    <https://www.microsoft.com/software-download/windows11>
@@ -183,13 +183,14 @@ Windows Server 2022 SERVERDATACENTER
 
 | 系统                                | 传统安装 | 云镜像 |
 | ----------------------------------- | -------- | ------ |
-| Debian                              | 384M     | 512M   |
-| Ubuntu                              | 1G       | 512M   |
-| CentOS / Alma / Rocky / Fedora      | 1G       | 512M   |
-| Alpine                              | 256M     | -      |
+| CentOS / Alma / Rocky               | -        | 512M   |
+| Fedora                              | -        | 512M   |
 | openSUSE                            | -        | 512M   |
-| Arch                                | -        | 512M   |
-| Gentoo                              | -        | 512M   |
+| Ubuntu                              | -        | 512M   |
+| Debian                              | 256M     | -      |
+| Alpine                              | 256M     | -      |
+| Arch                                | 512M     | -      |
+| Gentoo                              | 512M     | -      |
 | Windows 8.1 (Server 2012 R2) 或以下 | 512M     | -      |
 | Windows 10 (Server 2016) 或以上     | 1G       | -      |
 

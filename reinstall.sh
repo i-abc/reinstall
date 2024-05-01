@@ -3,7 +3,7 @@
 
 set -eE
 confhome=https://raw.githubusercontent.com/i-abc/reinstall/main
-github_proxy=https://gh.888853.xyz/gh-love
+github_proxy=https://gh.888853.xyz/gh-love/https://raw.githubusercontent.com
 
 # https://www.gnu.org/software/gettext/manual/html_node/The-LANGUAGE-variable.html
 export LC_ALL=C
@@ -20,22 +20,29 @@ trap_err() {
 }
 
 usage_and_exit() {
+    if is_in_windows; then
+        reinstall____=' reinstall.bat'
+    else
+        reinstall____='./reinstall.sh'
+    fi
     cat <<EOF
-Usage: reinstall.sh centos   7|8|9
-                    alma     8|9
-                    rocky    8|9
-                    fedora   38|39
-                    debian   10|11|12
-                    ubuntu   20.04|22.04
-                    alpine   3.16|3.17|3.18|3.19
-                    opensuse 15.5|tumbleweed
-                    arch
-                    gentoo
-                    dd       --img=http://xxx
-                    windows  --iso=http://xxx --image-name='windows xxx'
-                    netboot.xyz
+Usage: $reinstall____ centos   7|8|9
+                      alma     8|9
+                      rocky    8|9
+                      fedora   38|39|40
+                      debian   10|11|12
+                      ubuntu   20.04|22.04|24.04
+                      alpine   3.16|3.17|3.18|3.19
+                      opensuse 15.5|tumbleweed
+                      arch
+                      gentoo
+                      dd       --img='http://xxx'
+                      windows  --image-name='windows xxx yyy' --lang=xx-yy
+                      windows  --image-name='windows xxx yyy' --iso='http://xxx'
+                      netboot.xyz
 
 Manual: https://github.com/bin456789/reinstall
+
 EOF
     exit 1
 }
@@ -125,12 +132,12 @@ get_os_part() {
 }
 
 cp_to_btrfs_root() {
-    mount_dir=/tmp/reinstall-btrfs-root
+    mount_dir=$tmp/reinstall-btrfs-root
     if ! grep -q $mount_dir /proc/mounts; then
         mkdir -p $mount_dir
         mount "$(get_os_part)" $mount_dir -t btrfs -o subvol=/
     fi
-    cp -rf "$@" /tmp/reinstall-btrfs-root
+    cp -rf "$@" $tmp/reinstall-btrfs-root
 }
 
 is_host_has_ipv4_and_ipv6() {
@@ -204,7 +211,7 @@ test_url_real() {
         error_and_exit "$@"
     }
 
-    tmp_file=/tmp/reinstall-img-test
+    tmp_file=$tmp/reinstall-img-test
 
     # 有的服务器不支持 range，curl会下载整个文件
     # 用 dd 限制下载 1M
@@ -323,6 +330,368 @@ is_virt() {
     $_is_virt
 }
 
+# sr-latn-rs 到 sr-latn
+en_us() {
+    echo "$lang" | awk -F- '{print $1"-"$2}'
+
+    # zh-hk 可回落到 zh-tw
+    if [ "$lang" = zh-hk ]; then
+        echo zh-tw
+    fi
+}
+
+# fr-ca 到 ca
+us() {
+    # 葡萄牙准确对应 pp
+    if [ "$lang" = pt-pt ]; then
+        echo pp
+        return
+    fi
+    # 巴西准确对应 pt
+    if [ "$lang" = pt-br ]; then
+        echo pt
+        return
+    fi
+
+    echo "$lang" | awk -F- '{print $2}'
+
+    # hk 额外回落到 tw
+    if [ "$lang" = zh-hk ]; then
+        echo tw
+    fi
+}
+
+# fr-ca 到 fr-fr
+en_en() {
+    echo "$lang" | awk -F- '{print $1"-"$1}'
+
+    # en-gb 额外回落到 en-us
+    if [ "$lang" = en-gb ]; then
+        echo en-us
+    fi
+}
+
+# fr-ca 到 fr
+en() {
+    # 巴西/葡萄牙回落到葡萄牙语
+    if [ "$lang" = pt-br ] || [ "$lang" = pt-pt ]; then
+        echo "pp"
+        return
+    fi
+
+    echo "$lang" | awk -F- '{print $1}'
+}
+
+english() {
+    case "$lang" in
+    ar-sa) echo Arabic ;;
+    bg-bg) echo Bulgarian ;;
+    cs-cz) echo Czech ;;
+    da-dk) echo Danish ;;
+    de-de) echo German ;;
+    el-gr) echo Greek ;;
+    en-gb) echo Eng_Intl ;;
+    en-us) echo English ;;
+    es-es) echo Spanish ;;
+    es-mx) echo Spanish_Latam ;;
+    et-ee) echo Estonian ;;
+    fi-fi) echo Finnish ;;
+    fr-ca) echo FrenchCanadian ;;
+    fr-fr) echo French ;;
+    he-il) echo Hebrew ;;
+    hr-hr) echo Croatian ;;
+    hu-hu) echo Hungarian ;;
+    it-it) echo Italian ;;
+    ja-jp) echo Japanese ;;
+    ko-kr) echo Korean ;;
+    lt-lt) echo Lithuanian ;;
+    lv-lv) echo Latvian ;;
+    nb-no) echo Norwegian ;;
+    nl-nl) echo Dutch ;;
+    pl-pl) echo Polish ;;
+    pt-pt) echo Portuguese ;;
+    pt-br) echo Brazilian ;;
+    ro-ro) echo Romanian ;;
+    ru-ru) echo Russian ;;
+    sk-sk) echo Slovak ;;
+    sl-si) echo Slovenian ;;
+    sr-latn | sr-latn-rs) echo Serbian_Latin ;;
+    sv-se) echo Swedish ;;
+    th-th) echo Thai ;;
+    tr-tr) echo Turkish ;;
+    uk-ua) echo Ukrainian ;;
+    zh-cn) echo ChnSimp ;;
+    zh-hk | zh-tw) echo ChnTrad ;;
+    esac
+}
+
+parse_windows_image_name() {
+    set -- $image_name
+
+    if ! [ "$1" = windows ]; then
+        return 1
+    fi
+    shift
+
+    if [ "$1" = server ]; then
+        server=server
+        shift
+    fi
+    version=$1
+    shift
+
+    if [ "$1" = r2 ]; then
+        version+=" r2"
+        shift
+    fi
+
+    edition=
+    for i in "$@"; do
+        case "$i" in
+        # windows 10 enterprise n ltsc 2021
+        k | n | kn) ;;
+        *)
+            if [ -n "$edition" ]; then
+                edition+=" "
+            fi
+            edition+="$1"
+            ;;
+        esac
+        shift
+    done
+}
+
+is_have_arm_version() {
+    case "$version" in
+    10)
+        case "$edition" in
+        pro | 'pro for workstations' | education | 'pro education' | enterprise) return ;;
+        'iot enterprise') return ;;
+        'iot enterprise ltsc 2021' | 'enterprise ltsc 2021') return ;;
+        esac
+        ;;
+    11)
+        case "$edition" in
+        pro | 'pro for workstations' | education | 'pro education' | enterprise) return ;;
+        'iot enterprise') return ;;
+        esac
+        ;;
+    esac
+    return 1
+}
+
+find_windows_iso() {
+    parse_windows_image_name || error_and_exit "--image-name wrong: $image_name"
+    if ! [ "$version" = 8.1 ] && [ -z "$edition" ]; then
+        error_and_exit "Edition is not set."
+    fi
+    if [ "$basearch" = 'aarch64' ] && ! is_have_arm_version; then
+        error_and_exit "No ARM iso for this Windows Version."
+    fi
+
+    if [ -z "$lang" ]; then
+        lang=en-us
+    fi
+    langs="$lang $(en_us) $(us) $(en_en) $(en)"
+    langs=$(echo "$langs" | xargs -n 1 | awk '!seen[$0]++')
+    full_lang=$(english)
+
+    case "$basearch" in
+    x86_64) arch_win=x64 ;;
+    aarch64) arch_win=arm64 ;;
+    esac
+
+    get_windows_iso_links
+    get_windows_iso_link
+}
+
+get_windows_iso_links() {
+    get_label_msdn() {
+        if [ -n "$server" ]; then
+            case "$version" in
+            2008 | '2008 r2')
+                case "$edition" in
+                serverweb | serverwebcore) echo _ ;;
+                serverstandard | serverstandardcore) echo _ ;;
+                serverenterprise | serverenterprisecore) echo _ ;;
+                serverdatacenter | serverdatacentercore) echo _ ;;
+                esac
+                ;;
+            '2012 r2' | \
+                2016 | 2019 | 2022)
+                case "$edition" in
+                serverstandard | serverstandardcore) echo _ ;;
+                serverdatacenter | serverdatacentercore) echo _ ;;
+                esac
+                ;;
+            esac
+        else
+            case "$version" in
+            vista)
+                case "$edition" in
+                starter)
+                    case "$arch_win" in
+                    x86) echo _ ;;
+                    esac
+                    ;;
+                homebasic | homepremium | business | ultimate) echo _ ;;
+                enterprise) echo enterprise ;;
+                esac
+                ;;
+            7)
+                case "$edition" in
+                starter)
+                    case "$arch_win" in
+                    x86) echo ultimate ;;
+                    esac
+                    ;;
+                professional) echo professional ;;
+                homebasic | homepremium | ultimate) echo ultimate ;;
+                enterprise) echo enterprise ;;
+                esac
+                ;;
+            8.1)
+                case "$edition" in
+                '') echo _ ;;
+                pro) echo pro ;;
+                enterprise) echo enterprise ;;
+                esac
+                ;;
+            10)
+                case "$edition" in
+                home | 'home single language') echo consumer ;;
+                pro | 'pro for workstations' | education | 'pro education' | enterprise) echo business ;;
+                'iot enterprise') echo 'iot enterprise' ;;
+                'enterprise 2015 ltsb' | 'enterprise 2016 ltsb' | 'enterprise ltsc 2019') echo "$edition" ;;
+                'enterprise ltsc 2021')
+                    # arm64 的 enterprise ltsc 2021 要下载 iot enterprise ltsc 2021 iso
+                    case "$arch_win" in
+                    arm64) echo 'iot enterprise ltsc 2021' ;;
+                    x86 | x64) echo 'enterprise ltsc 2021' ;;
+                    esac
+                    ;;
+                'iot enterprise ltsc 2019' | 'iot enterprise ltsc 2021') echo "$edition" ;;
+                esac
+                ;;
+            11)
+                case "$edition" in
+                home | 'home single language') echo consumer ;;
+                pro | 'pro for workstations' | education | 'pro education' | enterprise) echo business ;;
+                'iot enterprise') echo 'iot enterprise' ;;
+                esac
+                ;;
+            esac
+        fi
+    }
+
+    get_label_vlsc() {
+        case "$version" in
+        10 | 11)
+            case "$edition" in
+            pro | 'pro for workstations' | education | 'pro education' | enterprise) echo pro ;;
+            esac
+            ;;
+        esac
+    }
+
+    get_page() {
+        if [ "$arch_win" = arm64 ]; then
+            echo arm
+        elif is_ltsc; then
+            echo ltsc
+        elif [ "$server" = 'server' ]; then
+            echo server
+        else
+            case "$version" in
+            vista | 7 | 8.1 | 10 | 11)
+                echo "$version"
+                ;;
+            esac
+        fi
+    }
+
+    is_ltsc() {
+        grep -Ewq 'ltsb|ltsc' <<<"$edition"
+    }
+
+    # 部分 bash 不支持 $() 里面嵌套case，所以定义成函数
+    label_msdn=$(get_label_msdn)
+    label_vlsc=$(get_label_vlsc)
+    page=$(get_page)
+
+    page_url=https://massgrave.dev/windows_${page}_links.html
+
+    info "Find windows iso"
+    echo "Version:    $version"
+    echo "Edition:    $edition"
+    echo "Label msdn: $label_msdn"
+    echo "Label vlsc: $label_vlsc"
+    echo "List:       $page_url"
+    echo
+
+    if [ -z "$page" ] || { [ -z "$label_msdn" ] && [ -z "$label_vlsc" ]; }; then
+        error_and_exit "Not support find this iso. Check --image-name or set --iso manually."
+    fi
+
+    curl -L "$page_url" | grep -ioP 'https://.*?.iso' | awk -F/ '{print $NF}' >$tmp/win.list
+
+    # 如果不是 ltsc ，应该先去除 ltsc 链接，否则最终链接有 ltsc 的
+    # 例如查找 windows 10 iot enterprise，会得到
+    # en-us_windows_10_iot_enterprise_ltsc_2021_arm64_dvd_e8d4fc46.iso
+    # en-us_windows_10_iot_enterprise_version_22h2_arm64_dvd_39566b6b.iso
+    # sed -Ei 和 sed -iE 是不同的
+    if is_ltsc; then
+        sed -Ei '/ltsc|ltsb/!d' $tmp/win.list
+    else
+        sed -Ei '/ltsc|ltsb/d' $tmp/win.list
+    fi
+}
+
+get_shortest_line() {
+    # awk '{print length($0), $0}' | sort -n | head -1 | awk '{print $2}'
+    awk '(NR == 1 || length($0) < length(shortest)) { shortest = $0 } END { print shortest }'
+}
+
+get_windows_iso_link() {
+    regexs=()
+
+    # msdn
+    if [ -n "$label_msdn" ]; then
+        if [ "$label_msdn" = _ ]; then
+            label_msdn=
+        fi
+        for lang in $langs; do
+            regex=
+            for i in ${lang} windows ${server} ${version} ${label_msdn}; do
+                if [ -n "$i" ]; then
+                    regex+="${i}_"
+                fi
+            done
+            regex+=".*${arch_win}.*.iso"
+            regexs+=("$regex")
+        done
+    fi
+
+    # vlsc
+    if [ -n "$label_vlsc" ]; then
+        regex="sw_dvd9_win_${label_vlsc}_${version}.*${arch_win}_${full_lang}.*.iso"
+        regexs+=("$regex")
+    fi
+
+    # 查找
+    for regex in "${regexs[@]}"; do
+        regex=${regex// /_}
+
+        echo "finding: $regex" >&2
+        if file=$(grep -Eix "$regex" "$tmp/win.list" | get_shortest_line | grep .); then
+            iso="https://drive.massgrave.dev/$file"
+            return
+        fi
+    done
+
+    error_and_exit "Could not find windows iso."
+}
+
 setos() {
     local step=$1
     local distro=$2
@@ -407,6 +776,7 @@ setos() {
         case "$releasever" in
         20.04) codename=focal ;;
         22.04) codename=jammy ;;
+        24.04) codename=noble ;;
         esac
 
         if is_use_cloud_image; then
@@ -416,15 +786,12 @@ setos() {
             else
                 ci_mirror=https://cloud-images.ubuntu.com
             fi
-
-            eval ${step}_img=$ci_mirror/releases/$releasever/release/ubuntu-$releasever-server-cloudimg-$basearch_alt.img
-
-            # minimal 镜像内核风味是 kvm，后台 vnc 无显示
-            # 没有 aarch64 minimal 镜像
-            # TODO: 在 trans 里安装普通内核/云内核
-            use_minimal_image=false
-            if $use_minimal_image && [ "$basearch" = x86_64 ]; then
+            # 20.04/22.04 minimal 镜像没有 aarch64
+            if { { [ "$releasever" = 20.04 ] || [ "$releasever" = 22.04 ]; } && [ "$basearch_alt" = amd64 ]; } ||
+                [ "$releasever" = 24.04 ]; then
                 eval ${step}_img=$ci_mirror/minimal/releases/$codename/release/ubuntu-$releasever-minimal-cloudimg-$basearch_alt.img
+            else
+                eval ${step}_img=$ci_mirror/releases/$releasever/release/ubuntu-$releasever-server-cloudimg-$basearch_alt.img
             fi
         else
             # 传统安装
@@ -453,38 +820,61 @@ setos() {
     }
 
     setos_arch() {
-        cloud_image=1
-
-        # cloud image
-        if is_in_china; then
-            ci_mirror=https://mirrors.tuna.tsinghua.edu.cn/archlinux
+        if [ "$basearch" = "x86_64" ]; then
+            if is_in_china; then
+                mirror=https://mirrors.tuna.tsinghua.edu.cn/archlinux
+            else
+                mirror=https://geo.mirror.pkgbuild.com
+            fi
         else
-            ci_mirror=https://geo.mirror.pkgbuild.com
+            if is_in_china; then
+                mirror=https://mirrors.tuna.tsinghua.edu.cn/archlinuxarm
+            else
+                # https 证书有问题
+                mirror=http://mirror.archlinuxarm.org
+            fi
         fi
-        # eval ${step}_img=$ci_mirror/images/latest/Arch-Linux-x86_64-basic.qcow2
-        eval ${step}_img=$ci_mirror/images/latest/Arch-Linux-x86_64-cloudimg.qcow2
+
+        if is_use_cloud_image; then
+            # cloud image
+            eval ${step}_img=$mirror/images/latest/Arch-Linux-x86_64-cloudimg.qcow2
+        else
+            # 传统安装
+            case "$basearch" in
+            x86_64) dir="core/os/$basearch" ;;
+            aarch64) dir="$basearch/core" ;;
+            esac
+            test_url $mirror/$dir/core.db gzip
+            eval ${step}_mirror=$mirror
+        fi
     }
 
     setos_gentoo() {
-        cloud_image=1
         if is_in_china; then
-            ci_mirror=https://mirrors.tuna.tsinghua.edu.cn/gentoo
+            mirror=https://mirrors.tuna.tsinghua.edu.cn/gentoo
         else
-            # ci_mirror=https://mirror.leaseweb.com/gentoo  # 不支持 ipv6
-            ci_mirror=https://distfiles.gentoo.org
+            # mirror=https://mirror.leaseweb.com/gentoo  # 不支持 ipv6
+            mirror=https://distfiles.gentoo.org
         fi
 
-        if [ "$basearch_alt" = arm64 ]; then
-            error_and_exit 'Not support arm64 for gentoo cloud image.'
-        fi
+        if is_use_cloud_image; then
+            if [ "$basearch_alt" = arm64 ]; then
+                error_and_exit 'Not support arm64 for gentoo cloud image.'
+            fi
 
-        # openrc 镜像没有附带兼容 cloud-init 的网络管理器
-        eval ${step}_img=$ci_mirror/experimental/$basearch_alt/openstack/gentoo-openstack-$basearch_alt-systemd-latest.qcow2
+            # openrc 镜像没有附带兼容 cloud-init 的网络管理器
+            eval ${step}_img=$mirror/experimental/$basearch_alt/openstack/gentoo-openstack-$basearch_alt-systemd-latest.qcow2
+        else
+            prefix=stage3-$basearch_alt-systemd
+            dir=releases/$basearch_alt/autobuilds/current-$prefix
+            file=$(curl -L $mirror/$dir/latest-$prefix.txt | grep '.tar.xz' | awk '{print $1}')
+            stage3=$mirror/$dir/$file
+            test_url $stage3 'xz'
+            eval ${step}_img=$stage3
+        fi
     }
 
     setos_opensuse() {
-        cloud_image=1
-
         # aria2 有 mata4 问题
         # https://download.opensuse.org/
 
@@ -519,6 +909,11 @@ setos() {
     }
 
     setos_windows() {
+        if [ -z "$iso" ]; then
+            echo "iso url is not set. Try to find it."
+            find_windows_iso
+        fi
+
         test_url $iso 'iso|dos/mbr'
         eval "${step}_iso='$iso'"
         eval "${step}_image_name='$image_name'"
@@ -564,9 +959,16 @@ setos() {
                 ;;
             "rocky") ci_image=$ci_mirror/Rocky-$releasever-GenericCloud-Base.latest.$basearch.qcow2 ;;
             "fedora")
-                filename=$(curl -L $ci_mirror | grep -oP "Fedora-Cloud-Base-$releasever.*?$basearch" | head -1)
-                # ci_image=$ci_mirror/$filename.raw.xz
-                ci_image=$ci_mirror/$filename.qcow2
+                # Fedora-Cloud-Base-39-1.5.x86_64.qcow2
+                # Fedora-Cloud-Base-Generic.x86_64-40-1.14.qcow2
+                page=$(curl -L $ci_mirror)
+                # 40
+                filename=$(grep -oP "Fedora-Cloud-Base-Generic.*?.qcow2" <<<"$page" | head -1)
+                # 38/39
+                if [ -z "$filename" ]; then
+                    filename=$(grep -oP "Fedora-Cloud-Base-$releasever.*?.qcow2" <<<"$page" | head -1)
+                fi
+                ci_image=$ci_mirror/$filename
                 ;;
             esac
 
@@ -617,6 +1019,8 @@ setos() {
     }
 
     eval ${step}_distro=$distro
+    eval ${step}_releasever=$releasever
+
     if is_distro_like_redhat $distro; then
         setos_redhat
     else
@@ -644,9 +1048,9 @@ verify_os_name() {
         'centos   7|8|9' \
         'alma     8|9' \
         'rocky    8|9' \
-        'fedora   38|39' \
+        'fedora   38|39|40' \
         'debian   10|11|12' \
-        'ubuntu   20.04|22.04' \
+        'ubuntu   20.04|22.04|24.04' \
         'alpine   3.16|3.17|3.18|3.19' \
         'opensuse 15.5|tumbleweed' \
         'arch' \
@@ -676,8 +1080,8 @@ verify_os_args() {
     case "$distro" in
     dd) [ -n "$img" ] || error_and_exit "dd need --img" ;;
     windows)
-        if [ -z "$iso" ] || [ -z "$image_name" ]; then
-            error_and_exit "Install Windows need --iso and --image-name"
+        if [ -z "$image_name" ]; then
+            error_and_exit "Install Windows need --image-name."
         fi
         ;;
     esac
@@ -709,6 +1113,17 @@ install_pkg() {
     cmd_to_pkg() {
         unset USE
         case $cmd in
+        ar)
+            case "$pkg_mgr" in
+            *) pkg="binutils" ;;
+            esac
+            ;;
+        xz)
+            case "$pkg_mgr" in
+            apt) pkg="xz-utils" ;;
+            *) pkg="xz" ;;
+            esac
+            ;;
         lsblk | findmnt)
             case "$pkg_mgr" in
             apk) pkg="$cmd" ;;
@@ -747,12 +1162,40 @@ install_pkg() {
         esac
     }
 
+    is_need_epel_repo() {
+        [ "$pkg" = dpkg ] && { [ "$pkg_mgr" = yum ] || [ "$pkg_mgr" = dnf ]; }
+    }
+
+    add_epel_repo() {
+        # epel 名称可能是 epel 或 ol9_developer_EPEL
+        # 如果没启用
+        if ! $pkg_mgr repolist | awk '{print $1}' | grep -qi 'epel$'; then
+            #  删除 epel repo，因为可能安装了但未启用
+            rm -rf /etc/yum.repos.d/*epel*.repo
+            epel_release="$($pkg_mgr list | grep 'epel-release' | awk '{print $1}' | cut -d. -f1 | head -1)"
+
+            # 如果已安装
+            if rpm -qa | grep -q $epel_release; then
+                # 检查是否为最新
+                if $pkg_mgr check-update $epel_release; then
+                    $pkg_mgr reinstall -y $epel_release
+                else
+                    $pkg_mgr update -y $epel_release
+                fi
+            else
+                # 如果未安装
+                $pkg_mgr install -y $epel_release
+            fi
+        fi
+    }
+
     install_pkg_real() {
         text="$pkg"
         if [ "$pkg" != "$cmd" ]; then
             text+=" ($cmd)"
         fi
         echo "Installing package '$text'..."
+
         case $pkg_mgr in
         dnf) dnf install -y --setopt=install_weak_deps=False $pkg ;;
         yum) yum install -y $pkg ;;
@@ -798,16 +1241,44 @@ install_pkg() {
                 error_and_exit "Can't find compatible package manager. Please manually install $cmd."
             fi
             cmd_to_pkg
+            if is_need_epel_repo; then
+                add_epel_repo
+            fi
             install_pkg_real
         fi
     done
 }
 
 check_ram() {
+    ram_standard=$(
+        case "$distro" in
+        netboot.xyz) echo 0 ;;
+        alpine | debian | dd) echo 256 ;;
+        arch | gentoo | windows) echo 512 ;;
+        centos | alma | rocky | fedora | ubuntu) echo 1024 ;;
+        opensuse) echo -1 ;; # 没有安装模式
+        esac
+    )
+
+    # 不用检查内存的情况
+    if [ "$ram_standard" -eq 0 ]; then
+        return
+    fi
+
+    # 未测试
+    ram_cloud_image=256
+
+    has_cloud_image=$(
+        case "$distro" in
+        centos | alma | rocky | fedora | debian | ubuntu | opensuse) echo true ;;
+        netboot.xyz | alpine | dd | arch | gentoo | windows) echo false ;;
+        esac
+    )
+
     if is_in_windows; then
         ram_size=$(wmic memorychip get capacity | tail +2 | awk '{sum+=$1} END {print sum/1024/1024}')
     else
-        # lsmem最准确但centos7 arm 和alpine不能用
+        # lsmem最准确但 centos7 arm 和 alpine 不能用，debian 9 util-linux 没有 lsmem
         # arm 24g dmidecode 显示少了128m
         # arm 24g lshw 显示23BiB
         # ec2 t4g arm alpine 用 lsmem 和 dmidecode 都无效，要用 lshw，但结果和free -m一致，其他平台则没问题
@@ -832,27 +1303,19 @@ check_ram() {
         error_and_exit "Could not detect RAM size."
     fi
 
-    case "$distro" in
-    alpine) ram_installer=256 ;; # 192 无法启动 netboot
-    debian) ram_installer=384 ;;
-    *) ram_installer=1024 ;;
-    esac
-
-    ram_cloud_image=512
-
-    case "$distro" in
-    opensuse | arch | gentoo) cloud_image=1 ;;
-    esac
-
     # ram 足够就用普通方法安装，否则如果内存大于512就用 cloud image
     # TODO: 测试 256 384 内存
-    if [ ! "$cloud_image" = 1 ] && [ $ram_size -lt $ram_installer ]; then
-        if [ $ram_size -ge $ram_cloud_image ]; then
-            info "RAM < $ram_installer MB. Switch to cloud image mode"
+    if ! is_use_cloud_image && [ $ram_size -lt $ram_standard ]; then
+        if $has_cloud_image; then
+            info "RAM < $ram_standard MB. Fallback to cloud image mode"
             cloud_image=1
         else
-            error_and_exit "Could not install $distro: RAM < $ram_cloud_image MB."
+            error_and_exit "Could not install $distro: RAM < $ram_standard MB."
         fi
+    fi
+
+    if is_use_cloud_image && [ $ram_size -lt $ram_cloud_image ]; then
+        error_and_exit "Could not install $distro using cloud image: RAM < $ram_cloud_image MB."
     fi
 }
 
@@ -907,6 +1370,10 @@ del_empty_lines() {
 
 # 记录主硬盘
 find_main_disk() {
+    if [ -n "$main_disk" ]; then
+        return
+    fi
+
     if is_in_windows; then
         # TODO:
         # 已测试 vista
@@ -1064,6 +1531,7 @@ collect_netconf() {
     echo "IPv4 Gateway: $ipv4_gateway"
     echo "IPv6 Address: $ipv6_addr"
     echo "IPv6 Gateway: $ipv6_gateway"
+    echo
 }
 
 add_efi_entry_in_windows() {
@@ -1187,7 +1655,7 @@ install_grub_linux_efi() {
             mirror=https://mirror.fcix.net/fedora/linux
         fi
 
-        curl -Lo /tmp/$grub_efi $mirror/releases/$fedora_ver/Everything/$basearch/os/EFI/BOOT/$grub_efi
+        curl -Lo $tmp/$grub_efi $mirror/releases/$fedora_ver/Everything/$basearch/os/EFI/BOOT/$grub_efi
     else
         if is_in_china; then
             mirror=https://mirror.sjtu.edu.cn/opensuse
@@ -1197,10 +1665,10 @@ install_grub_linux_efi() {
 
         [ "$basearch" = x86_64 ] && ports='' || ports=/ports/$basearch
 
-        curl -Lo /tmp/$grub_efi $mirror$ports/tumbleweed/repo/oss/EFI/BOOT/grub.efi
+        curl -Lo $tmp/$grub_efi $mirror$ports/tumbleweed/repo/oss/EFI/BOOT/grub.efi
     fi
 
-    add_efi_entry_in_linux /tmp/$grub_efi
+    add_efi_entry_in_linux $tmp/$grub_efi
 }
 
 install_grub_win() {
@@ -1209,10 +1677,10 @@ install_grub_win() {
     grub_ver=2.06
     is_in_china && grub_url=https://mirrors.tuna.tsinghua.edu.cn/gnu/grub/grub-$grub_ver-for-windows.zip ||
         grub_url=https://ftpmirror.gnu.org/gnu/grub/grub-$grub_ver-for-windows.zip
-    curl -Lo /tmp/grub.zip $grub_url
-    # unzip -qo /tmp/grub.zip
-    7z x /tmp/grub.zip -o/tmp -r -y -xr!i386-efi -xr!locale -xr!themes -bso0
-    grub_dir=/tmp/grub-$grub_ver-for-windows
+    curl -Lo $tmp/grub.zip $grub_url
+    # unzip -qo $tmp/grub.zip
+    7z x $tmp/grub.zip -o$tmp -r -y -xr!i386-efi -xr!locale -xr!themes -bso0
+    grub_dir=$tmp/grub-$grub_ver-for-windows
     grub=$grub_dir/grub
 
     # 设置 grub 包含的模块
@@ -1236,9 +1704,9 @@ install_grub_win() {
             alpine_ver=3.19
             is_in_china && mirror=http://mirrors.tuna.tsinghua.edu.cn/alpine || mirror=https://dl-cdn.alpinelinux.org/alpine
             grub_efi_apk=$(curl -L $mirror/v$alpine_ver/main/aarch64/ | grep -oP 'grub-efi-.*?apk' | head -1)
-            mkdir -p /tmp/grub-efi
-            curl -L "$mirror/v$alpine_ver/main/aarch64/$grub_efi_apk" | tar xz --warning=no-unknown-keyword -C /tmp/grub-efi/
-            cp -r /tmp/grub-efi/usr/lib/grub/arm64-efi/ $grub_dir
+            mkdir -p $tmp/grub-efi
+            curl -L "$mirror/v$alpine_ver/main/aarch64/$grub_efi_apk" | tar xz --warning=no-unknown-keyword -C $tmp/grub-efi/
+            cp -r $tmp/grub-efi/usr/lib/grub/arm64-efi/ $grub_dir
             $grub-mkimage -p $prefix -O arm64-efi -o "$(cygpath -w $grub_dir/grubaa64.efi)" $grub_modules
             add_efi_entry_in_windows $grub_dir/grubaa64.efi
         else
@@ -1258,8 +1726,8 @@ install_grub_win() {
             # 部分国内机无法访问 ftp.cn.debian.org
             is_in_china && host=mirrors.tuna.tsinghua.edu.cn || host=deb.debian.org
             curl -LO http://$host/debian/tools/win32-loader/stable/win32-loader.exe
-            7z x win32-loader.exe 'g2ldr.mbr' -o/tmp/win32-loader -r -y -bso0
-            find /tmp/win32-loader -name 'g2ldr.mbr' -exec cp {} /cygdrive/$c/ \;
+            7z x win32-loader.exe 'g2ldr.mbr' -o$tmp/win32-loader -r -y -bso0
+            find $tmp/win32-loader -name 'g2ldr.mbr' -exec cp {} /cygdrive/$c/ \;
 
             # g2ldr
             # 配置文件 c:\grub.cfg
@@ -1345,15 +1813,17 @@ build_nextos_cmdline() {
 
     if [ $nextos_distro = debian ]; then
         if [ "$basearch" = "x86_64" ]; then
-            # debian 不遵循最后一个 tty 为主 tty 的规则
-            # 设置ttyS0,tty0,最终结果是ttyS0
+            # debian 安装界面不遵循最后一个 tty 为主 tty 的规则
+            # 设置ttyS0,tty0,安装界面还是显示在ttyS0
             :
         else
-            # debian arm 不设置 tty 无法启动
-            nextos_cmdline+=" $(echo_tmp_ttys)"
+            # debian arm 在没有ttyAMA0的机器上（aws t4g），最少要设置一个tty才能启动
+            # 只设置tty0也行，但安装过程ttyS0没有显示
+            nextos_cmdline+=" console=ttyS0,115200 console=ttyAMA0,115200 console=tty0"
         fi
     else
-        nextos_cmdline+=" $(echo_tmp_ttys)"
+        # nextos_cmdline+=" $(echo_tmp_ttys)"
+        nextos_cmdline+=" console=ttyS0,115200 console=ttyAMA0,115200 console=tty0"
     fi
     # nextos_cmdline+=" mem=256M"
 }
@@ -1405,7 +1875,8 @@ mod_initrd_debian() {
         db_progress START 0 5 debian-installer/netcfg/title
 
         # 找到主网卡
-        # debian 11 initrd 没有 awk
+        # debian 11 initrd 没有 xargs awk
+        # debian 12 initrd 没有 xargs
         if false; then
             iface=$(ip -o link | grep "@mac_addr" | awk '{print $2}' | cut -d: -f1)
         else
@@ -1434,6 +1905,7 @@ id-assoc na 0 {
 EOF
         dhcp6c -c /var/lib/netcfg/dhcp6c.conf "$iface"
         sleep 10
+        # kill-all-dhcp
         kill -9 "$(cat /var/run/dhcp6c.pid)"
         db_progress STEP 1
 
@@ -1445,7 +1917,7 @@ EOF
 
         # 运行trans.sh，保存配置
         db_progress INFO base-installer/progress/netcfg
-        . /trans.sh
+        sh /trans.sh
         db_progress STEP 1
     }
 
@@ -1456,6 +1928,209 @@ EOF
     get_function_content netcfg |
         sed "s|@mac_addr|$mac_addr|" |
         sed "s|@netconf|$netconf|" >var/lib/dpkg/info/netcfg.postinst
+
+    # shellcheck disable=SC2317
+    expand_packages() {
+        expand_packages_real "$@" | while read -r k_ v; do
+            # shellcheck disable=SC2001
+            case $(echo "$k_" | sed 's/://') in
+            Package)
+                package="$v"
+                ;;
+            Priority)
+                # shellcheck disable=SC2154
+                if [ "$v" = standard ] && echo "$disabled_list" | grep -qx "$package"; then
+                    v=optional
+                fi
+                ;;
+            esac
+
+            if [ -z "$k_" ]; then
+                echo
+            else
+                echo "$k_ $v"
+            fi
+        done
+    }
+
+    # shellcheck disable=SC2012
+    kver=$(ls -d lib/modules/* | awk -F/ '{print $NF}')
+
+    net_retriever=usr/lib/debian-installer/retriever/net-retriever
+    sed -i 's/^expand_packages()/expand_packages_real()/' $net_retriever
+    insert_into_file $net_retriever after '#!/bin/sh' <<EOF
+disabled_list="
+depthcharge-tools-installer
+kickseed-common
+nobootloader
+partman-btrfs
+partman-cros
+partman-iscsi
+partman-jfs
+partman-md
+partman-xfs
+rescue-check
+wpasupplicant-udeb
+nic-modules-$kver-di
+nic-pcmcia-modules-$kver-di
+nic-usb-modules-$kver-di
+nic-wireless-modules-$kver-di
+nic-shared-modules-$kver-di
+pcmcia-modules-$kver-di
+pcmcia-storage-modules-$kver-di
+cdrom-core-modules-$kver-di
+firewire-core-modules-$kver-di
+usb-storage-modules-$kver-di
+isofs-modules-$kver-di
+jfs-modules-$kver-di
+xfs-modules-$kver-di
+loop-modules-$kver-di
+pata-modules-$kver-di
+sata-modules-$kver-di
+scsi-modules-$kver-di
+"
+
+expand_packages() {
+    $(get_function_content expand_packages)
+}
+EOF
+
+    # https://github.com/linuxhw/LsPCI?tab=readme-ov-file#storageata-pci
+    # https://debian.pkgs.org/12/debian-main-amd64/linux-image-6.1.0-18-cloud-amd64_6.1.76-1_amd64.deb.html
+    # 以下是 debian-installer 有的驱动，这些驱动云内核不一定都有，(+)表示有
+    # scsi-core-modules 是 ata-modules 的依赖，包含 sd_mod.ko(+) scsi_mod.ko(+)
+    # ata-modules       是下方模块的依赖，Priority 是 optional。只有 ata_generic.ko(+) 和 libata.ko(+) 两个驱动
+    # pata-modules      里面的驱动都是 pata_ 开头
+    #                   但只有 pata_legacy.ko(+) 在云内核中
+    # sata-modules      里面的驱动大部分是 sata_ 开头的，其他重要的还有 ahci.ko libahci.ko ata_piix.ko(+)
+    #                   云内核没有 sata 模块，也没有内嵌，有一个 CONFIG_SATA_HOST=y，libata-$(CONFIG_SATA_HOST)	+= libata-sata.o
+    # scsi-modules      包含 virtio_scsi.ko(+) virtio_blk.ko(+)
+
+    download_and_extract_udeb() {
+        package=$1
+        extract_dir=$2
+
+        # 获取 udeb 列表
+        udeb_list=$tmp/udeb_list
+        if ! [ -f $udeb_list ]; then
+            curl -L http://$deb_hostname/debian/dists/$codename/main/debian-installer/binary-$basearch_alt/Packages.gz |
+                zcat | grep 'Filename:' | awk '{print $2}' >$udeb_list
+        fi
+
+        # 下载 udeb
+        curl -Lo $tmp/tmp.udeb http://$deb_hostname/debian/"$(grep /$package $udeb_list)"
+
+        if false; then
+            # 使用 dpkg
+            # cygwin 没有 dpkg
+            install_pkg dpkg
+            dpkg -x $tmp/tmp.udeb $extract_dir
+        else
+            # 使用 ar tar xz
+            # cygwin 需安装 binutils
+            # centos7 ar 不支持 --output
+            install_pkg ar tar xz
+            (cd $tmp && ar x $tmp/tmp.udeb)
+            tar xf $tmp/data.tar.xz -C $extract_dir
+        fi
+    }
+
+    # 不用在 windows 判断是哪种硬盘控制器，因为 256M 运行 windows 只可能是 xp，而脚本本来就不支持 xp
+    get_disk_controller() {
+        (
+            cd "$(readlink -f /sys/block/$xda)"
+            while ! [ "$(pwd)" = / ]; do
+                if [ -d driver ]; then
+                    basename "$(readlink -f driver)"
+                fi
+                cd ..
+            done
+        )
+    }
+
+    can_use_cloud_kernel() {
+        # xen 是 vbd
+        # 有些虚拟机用了 ahci，但云内核没有 ahci 驱动
+        # shellcheck disable=SC2317
+        get_disk_controller | grep -Ewq \
+            'ata_generic|ata_piix|pata_legacy|nvme|virtio_blk|virtio_scsi|vbd|hv_storvsc|vmw_pvscsi'
+    }
+
+    # 在 debian installer 中判断能否用云内核
+    cat <<EOF >can_use_cloud_kernel.sh
+        get_disk_controller(){
+            $(get_function_content get_disk_controller)
+        }
+
+        can_use_cloud_kernel(){
+            $(get_function_content can_use_cloud_kernel)
+        }
+
+        can_use_cloud_kernel
+EOF
+
+    # 提前下载 fdisk
+    # 因为 fdisk-udeb 包含 fdisk 和 sfdisk，提前下载可减少占用
+    mkdir_clear $tmp/fdisk
+    download_and_extract_udeb fdisk-udeb $tmp/fdisk
+    cp -f $tmp/fdisk/usr/sbin/fdisk usr/sbin/
+
+    if [ $ram_size -gt 256 ]; then
+        sed -i '/^pata-modules/d' $net_retriever
+        sed -i '/^sata-modules/d' $net_retriever
+        sed -i '/^scsi-modules/d' $net_retriever
+    else
+        # <=256M 极限优化
+        find_main_disk
+        extra_drivers=
+        for driver in $(get_disk_controller); do
+            echo "using driver: $driver"
+            case $driver in
+            # xen 是 vbd
+            nvme | virtio_blk | virtio_scsi | vbd | hv_storvsc | vmw_pvscsi) extra_drivers+=" $driver" ;;
+            pata_legacy) sed -i '/^pata-modules/d' $net_retriever ;;
+            pata_* | sata_* | ahci) error_and_exit "Debian cloud kernel does not support this driver: $driver" ;;
+            esac
+        done
+
+        # extra drivers
+        # 先不管 xen vmware
+        if [ -n "$extra_drivers" ]; then
+            mkdir_clear $tmp/scsi
+            download_and_extract_udeb scsi-modules-$kver-di $tmp/scsi
+            (
+                cd lib/modules/*/kernel/drivers/
+                for driver in $extra_drivers; do
+                    echo "adding driver: $driver"
+                    case $driver in
+                    nvme)
+                        mkdir -p nvme/host
+                        cp -f $tmp/scsi/lib/modules/*/kernel/drivers/nvme/host/nvme.ko nvme/host/
+                        cp -f $tmp/scsi/lib/modules/*/kernel/drivers/nvme/host/nvme-core.ko nvme/host/
+                        ;;
+                    virtio_blk)
+                        mkdir -p block
+                        cp -f $tmp/scsi/lib/modules/*/kernel/drivers/block/virtio_blk.ko block/
+                        ;;
+                    virtio_scsi)
+                        mkdir -p scsi
+                        cp -f $tmp/scsi/lib/modules/*/kernel/drivers/scsi/virtio_scsi.ko scsi/
+                        ;;
+                    hv_storvsc)
+                        mkdir -p scsi
+                        cp -f $tmp/scsi/lib/modules/*/kernel/drivers/scsi/hv_storvsc.ko scsi/
+                        cp -f $tmp/scsi/lib/modules/*/kernel/drivers/scsi/scsi_transport_fc.ko scsi/
+                        ;;
+                    esac
+                done
+            )
+        fi
+    fi
+
+    # 将 use_level 2 9 修改为 use_level 1
+    # x86 use_level 2 会出现 No root file system is defined.
+    # arm 即使 use_level 1 也会出现 No root file system is defined.
+    sed -i 's/use_level=[29]/use_level=1/' lib/debian-installer-startup.d/S15lowmem
 
     # hack 3
     # 修改 trans.sh
@@ -1488,25 +2163,25 @@ EOF
 }
 
 mod_initrd_alpine() {
-    # virt 内核添加 ipv6 模块
+    # hack 1 virt 内核添加 ipv6 模块
     if virt_dir=$(ls -d $tmp_dir/lib/modules/*-virt 2>/dev/null); then
         ipv6_dir=$virt_dir/kernel/net/ipv6
-        mkdir -p $ipv6_dir
-        modloop_file=/tmp/modloop_file
-        modloop_dir=/tmp/modloop_dir
-        curl -Lo $modloop_file $nextos_modloop
-        if is_in_windows; then
-            # cygwin 没有 unsquashfs
-            7z e $modloop_file ipv6.ko -r -y -o$ipv6_dir
-        else
-            install_pkg unsquashfs
-            mkdir_clear $modloop_dir
-            unsquashfs -f -d $modloop_dir $modloop_file 'modules/*/kernel/net/ipv6/ipv6.ko'
-            find $modloop_dir -name ipv6.ko -exec cp {} $ipv6_dir/ \;
+        if ! [ -f $ipv6_dir/ipv6.ko ]; then
+            mkdir -p $ipv6_dir
+            modloop_file=$tmp/modloop_file
+            modloop_dir=$tmp/modloop_dir
+            curl -Lo $modloop_file $nextos_modloop
+            if is_in_windows; then
+                # cygwin 没有 unsquashfs
+                7z e $modloop_file ipv6.ko -r -y -o$ipv6_dir
+            else
+                install_pkg unsquashfs
+                mkdir_clear $modloop_dir
+                unsquashfs -f -d $modloop_dir $modloop_file 'modules/*/kernel/net/ipv6/ipv6.ko'
+                find $modloop_dir -name ipv6.ko -exec cp {} $ipv6_dir/ \;
+            fi
         fi
     fi
-
-    # hack 1 添加 ipv6 模块
     insert_into_file init after 'configure_ip\(\)' <<EOF
         depmod
         modprobe ipv6
@@ -1599,15 +2274,82 @@ mod_initrd() {
 
     # 解压
     # 先删除临时文件，避免之前运行中断有残留文件
-    tmp_dir=/tmp/reinstall
+    tmp_dir=$tmp/reinstall
     mkdir_clear $tmp_dir
     cd $tmp_dir
-    zcat /reinstall-initrd | cpio -idm
+
+    # cygwin 下处理 debian initrd 时
+    # 解压/重新打包/删除 initrd 的 /dev/console /dev/null 都会报错
+    # cpio: dev/console: Cannot utime: Invalid argument
+    # cpio: ./dev/console: Cannot stat: Bad address
+    # 用 windows 文件管理器可删除
+
+    # 但同样运行 zcat /reinstall-initrd | cpio -idm
+    # 打开 C:\cygwin\Cygwin.bat ，运行报错
+    # 打开桌面的 Cygwin 图标，运行就没问题
+
+    # shellcheck disable=SC2046
+    # nonmatching 是精确匹配路径
+    zcat /reinstall-initrd | cpio -idm \
+        $(is_in_windows && echo --nonmatching 'dev/console' --nonmatching 'dev/null')
 
     curl -Lo $tmp_dir/trans.sh $confhome/trans.sh
     curl -Lo $tmp_dir/alpine-network.sh $confhome/alpine-network.sh
 
     mod_initrd_$nextos_distro
+
+    # 显示精简前的大小
+    du -sh .
+
+    # 删除 initrd 里面没用的文件/驱动
+    if is_virt && ! is_alpine_live; then
+        rm -rf bin/brltty
+        rm -rf etc/brltty
+        rm -rf sbin/wpa_supplicant
+        rm -rf usr/lib/libasound.so.*
+        rm -rf usr/share/alsa
+        (
+            cd lib/modules/*/kernel/drivers/net/ethernet/
+            for item in *; do
+                case "$item" in
+                intel | amazon | google) ;;
+                *) rm -rf $item ;;
+                esac
+            done
+        )
+        (
+            cd lib/modules/*/kernel
+            for item in \
+                net/mac80211 \
+                net/wireless \
+                net/bluetooth \
+                drivers/hid \
+                drivers/mmc \
+                drivers/mtd \
+                drivers/usb \
+                drivers/ssb \
+                drivers/mfd \
+                drivers/bcma \
+                drivers/pcmcia \
+                drivers/parport \
+                drivers/platform \
+                drivers/staging \
+                drivers/net/usb \
+                drivers/net/bonding \
+                drivers/net/wireless \
+                drivers/input/rmi4 \
+                drivers/input/keyboard \
+                drivers/input/touchscreen \
+                drivers/bus/mhi \
+                drivers/char/pcmcia \
+                drivers/misc/cardreader; do
+                rm -rf $item
+            done
+        )
+    fi
+
+    # 显示精简后的大小
+    du -sh .
 
     # 重建
     # 注意要用 cpio -H newc 不要用 cpio -c ，不同版本的 -c 作用不一样，很坑
@@ -1631,7 +2373,7 @@ if is_in_windows; then
     fi
 
     # 更改 windows 命令输出语言为英文
-    # chcp.com 437 # 会清屏
+    # chcp 会清屏
     mode.com con cp select=437 >/dev/null
 fi
 
@@ -1648,7 +2390,7 @@ else
 fi
 
 # 整理参数
-if ! opts=$(getopt -n $0 -o "" --long debug,hold:,sleep:,iso:,image-name:,img:,ci,cloud-image -- "$@"); then
+if ! opts=$(getopt -n $0 -o "" --long ci,debug,hold:,sleep:,iso:,image-name:,img:,lang: -- "$@"); then
     usage_and_exit
 fi
 
@@ -1660,12 +2402,15 @@ while true; do
         set -x
         shift
         ;;
-    --ci | --cloud-image)
+    --ci)
         cloud_image=1
         shift
         ;;
     --hold | --sleep)
         hold=$2
+        if ! { [ "$hold" = 1 ] || [ "$hold" = 2 ]; }; then
+            error_and_exit "Invalid --hold value: $hold."
+        fi
         shift 2
         ;;
     --img)
@@ -1677,7 +2422,11 @@ while true; do
         shift 2
         ;;
     --image-name)
-        image_name=$2
+        image_name=$(echo "$2" | to_lower)
+        shift 2
+        ;;
+    --lang)
+        lang=$(echo "$2" | to_lower)
         shift 2
         ;;
     --)
@@ -1708,18 +2457,25 @@ fi
 # 必备组件
 install_pkg curl grep
 
-# 检查内存
-if ! { [ "$distro" = dd ] || [ "$distro" = windows ] || [ "$distro" = netboot.xyz ]; }; then
-    check_ram
-fi
+# /tmp 挂载在内存的话，可能不够空间
+tmp=/reinstall-tmp
+mkdir -p "$tmp"
 
-# 以下系统忽略 --ci 参数
-if is_use_cloud_image && {
-    [ "$distro" = dd ] || [ "$distro" = windows ] || [ "$distro" = netboot.xyz ] || [ "$distro" = alpine ]
-}; then
-    echo "ignored --ci"
-    cloud_image=0
-fi
+# 强制忽略/强制添加 --ci 参数
+case "$distro" in
+dd | windows | netboot.xyz | debian | alpine | arch | gentoo)
+    if is_use_cloud_image; then
+        echo "ignored --ci"
+        cloud_image=0
+    fi
+    ;;
+centos | alma | rocky | ubuntu | fedora | opensuse)
+    cloud_image=1
+    ;;
+esac
+
+# 检查内存
+check_ram
 
 # 检查硬件架构
 if is_in_windows; then
@@ -1753,8 +2509,8 @@ esac
 # jsdelivr 有12小时缓存
 # https://github.com/XIU2/UserScript/blob/master/GithubEnhanced-High-Speed-Download.user.js#L31
 if [ -n "$github_proxy" ] && [[ "$confhome" = http*://raw.githubusercontent.com/* ]] && is_in_china; then
-    confhome=$github_proxy/$confhome
-    # confhome=${confhome/raw.githubusercontent.com/$github_proxy}
+    confhome=${confhome/http:\/\//https:\/\/}
+    confhome=${confhome/https:\/\/raw.githubusercontent.com/$github_proxy}
 fi
 
 # 以下目标系统不需要两步安装
@@ -1962,7 +2718,7 @@ if is_use_grub; then
     # 生成 grub 配置
     # 实测 centos 7 lvm 要手动加载 lvm 模块
     echo $target_cfg
-    cat <<EOF | del_empty_lines | tee $target_cfg
+    del_empty_lines <<EOF | tee $target_cfg
 set timeout=5
 menuentry "$(get_entry_name)" {
     $(! is_in_windows && echo 'insmod lvm')
@@ -1998,4 +2754,9 @@ else
     echo "Username: $username"
     echo "Password: 123@@@"
     echo "Reboot to start the installation."
+fi
+
+if is_in_windows; then
+    echo 'Run this command to reboot:'
+    echo 'shutdown /r /t 0'
 fi

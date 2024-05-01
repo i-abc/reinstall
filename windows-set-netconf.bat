@@ -11,6 +11,7 @@ rem set ipv6_dns1=::1
 rem set ipv6_dns2=::2
 
 @echo off
+mode con cp select=437 >nul
 setlocal EnableDelayedExpansion
 
 rem 禁用 IPv6 地址标识符的随机化，防止 IPv6 和后台面板不一致
@@ -29,7 +30,7 @@ if defined mac_addr (
         rem 配置静态 IPv4 DNS 服务器
         for %%i in (1, 2) do (
             if defined ipv4_dns%%i (
-                netsh interface ipv4 add | find "dnsservers"
+                netsh interface ipv4 add | findstr "dnsservers"
                 if ErrorLevel 1 (
                     rem vista
                     netsh interface ipv4 add dnsserver !id! !ipv4_dns%%i! %%i
@@ -49,7 +50,7 @@ if defined mac_addr (
         rem 配置 IPv6 DNS 服务器
         for %%i in (1, 2) do (
             if defined ipv6_dns%%i (
-                netsh interface ipv6 add | find "dnsservers"
+                netsh interface ipv6 add | findstr "dnsservers"
                 if ErrorLevel 1 (
                     rem vista
                     netsh interface ipv6 add dnsserver !id! !ipv6_dns%%i! %%i

@@ -1,7 +1,8 @@
 @echo off
+mode con cp select=437 >nul
 setlocal EnableDelayedExpansion
 set confhome=https://raw.githubusercontent.com/i-abc/reinstall/main
-set github_proxy=https://gh.888853.xyz/gh-love
+set github_proxy=https://gh.888853.xyz/gh-love/https://raw.githubusercontent.com
 
 rem 不要用 :: 注释
 rem 否则可能会出现 系统找不到指定的驱动器
@@ -14,8 +15,8 @@ rem 进入脚本目录
 cd /d %~dp0
 
 rem 检查是否有管理员权限
-openfiles 1>nul 2>&1
-if not !errorlevel! == 0 (
+fltmc >nul 2>&1
+if errorlevel 1 (
     echo Please run as administrator^^!
     exit /b
 )
@@ -32,15 +33,15 @@ if not exist %tmp%\geoip (
     call :download http://dash.cloudflare.com/cdn-cgi/trace %tmp%\geoip
 )
 findstr /c:"loc=CN" %tmp%\geoip >nul
-if !errorlevel! == 0 (
+if not errorlevel 1 (
     rem mirrors.tuna.tsinghua.edu.cn 会强制跳转 https
     set mirror=http://mirror.nju.edu.cn
 
     if defined github_proxy (
         echo !confhome! | findstr /c:"://raw.githubusercontent.com/" >nul
-        if !errorlevel! == 0 (
-            set confhome=!github_proxy!/!confhome!
-            rem set confhome=!confhome:raw.githubusercontent.com=%github_proxy%!
+        if not errorlevel 1 (
+            set confhome=!confhome:http://=https://!
+            set confhome=!confhome:https://raw.githubusercontent.com=%github_proxy%!
         )
     )
 ) else (
@@ -48,7 +49,7 @@ if !errorlevel! == 0 (
 )
 
 rem pkgs 改动了才重新运行 Cygwin 安装程序
-set pkgs="curl,cpio,p7zip,bind-utils,ipcalc"
+set pkgs="curl,cpio,p7zip,bind-utils,ipcalc,dos2unix,binutils"
 set tags=%tmp%\cygwin-installed-!pkgs!
 if not exist !tags! (
     rem win10 arm 支持运行 x86 软件
@@ -79,7 +80,7 @@ if not exist !tags! (
     rem win7/8 cygwin 已 EOL，不能用最新 cygwin 源，而要用 Cygwin Time Machine 源
     rem 但 Cygwin Time Machine 没有国内源
     rem 为了保证国内下载速度, cygwin EOL 统一使用 cygwin-archive x86 源
-    if !CygwinEOL! == "1" (
+    if !CygwinEOL! == 1 (
         set CygwinArch=x86
         set dir=/sourceware/cygwin-archive/20221123
     ) else (
@@ -116,12 +117,13 @@ rem 在c盘根目录下执行 cygpath -ua . 会得到 /cygdrive/c，因此末尾
 for /f %%a in ('%SystemDrive%\cygwin\bin\cygpath -ua ./') do set thisdir=%%a
 
 rem 方法1
+%SystemDrive%\cygwin\bin\dos2unix -q '%thisdir%reinstall.sh'
 %SystemDrive%\cygwin\bin\bash -l -c '%thisdir%reinstall.sh !param!'
 
 rem 方法2
 rem %SystemDrive%\cygwin\bin\bash reinstall.sh %*
 rem 再在 reinstall.sh 里运行 source /etc/profile
-exit /b !errorlevel!
+exit /b
 
 
 
@@ -131,6 +133,10 @@ exit /b !errorlevel!
 rem bits 要求有 Content-Length 才能下载
 rem https://learn.microsoft.com/en-us/windows/win32/bits/http-requirements-for-bits-downloads
 rem certutil 会被 windows Defender 报毒
+rem windows server 2019 要用第二条 certutil 命令
 echo Download: %~1 %~2
 certutil -urlcache -f -split %~1 %~2
-exit /b !errorlevel!
+if not exist %~2 (
+    certutil -urlcache -split %~1 %~2
+)
+exit /b

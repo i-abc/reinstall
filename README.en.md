@@ -11,8 +11,7 @@ One-click reinstallation script
 ## Highlights
 
 - Installing using official cloud images (Cloud Image) allows bypassing the [memory requirements](https://access.redhat.com/articles/rhel-limits#minimum-required-memory-3) of traditional network installations, resulting in faster installation speed.
-- Using official cloud images for installation ensures fast installation speed and can also avoid issues with netboot installation on machines with limited memory.
-- Compatible with 512M + 5G small servers and supports installing Alpine on 256M small servers.
+- Compatible with 512M + 5G small servers and supports installing Alpine or Debain on 256M small servers.
 - Compatible with all network conditions, including dynamic/static IPv4/IPv6 and pure IPv4/IPv6.
 - Supports installing Windows using the official ISO.
 - Supports reinstalling Windows as Linux or Windows itself.
@@ -34,7 +33,7 @@ curl -O https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh
 For users in China:
 
 ```bash
-curl -O https://raw.gitmirror.com/bin456789/reinstall/main/reinstall.sh
+curl -O https://mirror.ghproxy.com/https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.sh
 ```
 
 ## Download (Current system is Windows)
@@ -52,7 +51,7 @@ certutil -urlcache -f -split https://raw.githubusercontent.com/bin456789/reinsta
 For users in China:
 
 ```batch
-certutil -urlcache -f -split https://raw.gitmirror.com/bin456789/reinstall/main/reinstall.bat
+certutil -urlcache -f -split https://mirror.ghproxy.com/https://raw.githubusercontent.com/bin456789/reinstall/main/reinstall.bat
 ```
 
 ## Usage
@@ -64,35 +63,25 @@ All features can be used on both Linux and Windows.
 
 ### Feature 1: Install Linux
 
-- The parameter --ci indicates forced usage of the cloud image for installation.
-- Machines with static IP installing CentOS, Alma, Rocky, Fedora, Ubuntu must include the parameter `--ci`.
-- If it is uncertain whether the machine has a static or dynamic IP, you can also add the parameter `--ci`.
+- If no version number is entered, the latest version will be installed.
+- When installing on a virtual machine, it will automatically select a slimmed-down kernel.
 
 ```bash
 bash reinstall.sh centos   7|8|9  (8|9 for the stream version)
                   alma     8|9
                   rocky    8|9
-                  fedora   38|39
+                  fedora   38|39|40
                   debian   10|11|12
-                  ubuntu   20.04|22.04
-                  alpine   3.16|3.17|3.18|3.19
                   opensuse 15.5|tumbleweed
-                  arch     (not supports ARM)
-                  gentoo   (not supports ARM)
-
-                  If no version number is entered, the latest version will be installed.
-```
-
-Parameters:
-
-```bash
---ci              Force the use of the cloud image
+                  ubuntu   20.04|22.04|24.04
+                  alpine   3.16|3.17|3.18|3.19
+                  arch
+                  gentoo
 ```
 
 ### Feature 2: DD
 
 - Supports gzip, xz formats.
-
 - For machines with static IP, DD Windows, and the script will automatically configure the IP.
 
 ```bash
@@ -102,7 +91,6 @@ bash reinstall.sh dd --img https://example.com/xxx.xz
 ### Feature 3: Reboot to Alpine Rescue System (Live OS)
 
 - Can be connected via SSH to perform manual DD, modify partitions, manually install Arch / Gentoo, etc.
-
 - If the disk content is not modified, rebooting again will return to the original system.
 
 ```bash
@@ -112,6 +100,7 @@ bash reinstall.sh alpine --hold=1
 ### Feature 4: Reboot to netboot.xyz
 
 - Can install [more systems](https://github.com/netbootxyz/netboot.xyz?tab=readme-ov-file#what-operating-systems-are-currently-available-on-netbootxyz) using web panel VNC.
+- If the disk content is not modified, rebooting again will return to the original system.
 
 ```bash
 bash reinstall.sh netboot.xyz
@@ -125,17 +114,25 @@ bash reinstall.sh netboot.xyz
 
 ```bash
 bash reinstall.sh windows \
-     --iso 'https://drive.massgrave.dev/en-us_windows_10_enterprise_ltsc_2021_x64_dvd_d289cf96.iso' \
-     --image-name 'Windows 10 Enterprise LTSC 2021'
+     --image-name 'Windows 10 Enterprise LTSC 2021' \
+     --iso 'https://drive.massgrave.dev/en-us_windows_10_enterprise_ltsc_2021_x64_dvd_d289cf96.iso'
+```
+
+- Now supports automatically searching for Windows (including LTSC) and Windows Server ISO links.
+- Need to set the language using `--lang`, default `en-us`.
+- Search Source: <https://massgrave.dev/genuine-installation-media.html>
+
+```bash
+bash reinstall.sh windows \
+     --image-name 'Windows 10 Enterprise LTSC 2021' \
+     --lang zh-cn
 ```
 
 ![Installing Windows](https://github.com/bin456789/reinstall/assets/7548515/07c1aea2-1ce3-4967-904f-aaf9d6eec3f7)
 
-Parameters:
+Parameters Description:
 
-`--iso` Original image link
-
-`--image-name` Specify the image to install, case-insensitive, for example:
+`--image-name` Specify the image to install, case-insensitive, Commonly used images include:
 
 ```text
 Windows 7 Ultimate
@@ -156,11 +153,11 @@ Use `Dism++` File menu > Open Image File, select the iso to be installed to get 
      - Hyper-V Server
      - Azure Stack HCI
 2. The script will install the following drivers as needed:
-    - KVM ([Virtio](https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/))
-    - XEN ([XEN PV](https://xenproject.org/windows-pv-drivers/), [AWS PV](https://docs.aws.amazon.com/zh_cn/AWSEC2/latest/WindowsGuide/xen-drivers-overview.html))
-    - AWS ([ENA Network Adapter](https://docs.aws.amazon.com/zh_cn/AWSEC2/latest/WindowsGuide/enhanced-networking-ena.html), [NVMe Storage Controller](https://docs.aws.amazon.com/zh_cn/AWSEC2/latest/WindowsGuide/aws-nvme-drivers.html))
-    - GCP ([gVNIC Network Adapter](https://cloud.google.com/compute/docs/networking/using-gvnic), [GGA Graphics](https://cloud.google.com/compute/docs/instances/enable-instance-virtual-display))
-    - Azure ([MANA Network Adapter](https://learn.microsoft.com/zh-cn/azure/virtual-network/accelerated-networking-mana-windows))
+   - KVM ([Virtio](https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/))
+   - XEN ([XEN](https://xenproject.org/windows-pv-drivers/), [Citrix](https://docs.aws.amazon.com/AWSEC2/latest/WindowsGuide/Upgrading_PV_drivers.html#win2008-citrix-upgrade), [AWS](https://docs.aws.amazon.com/AWSEC2/latest/WindowsGuide/xen-drivers-overview.html))
+   - AWS ([ENA Network Adapter](https://docs.aws.amazon.com/AWSEC2/latest/WindowsGuide/enhanced-networking-ena.html), [NVMe Storage Controller](https://docs.aws.amazon.com/AWSEC2/latest/WindowsGuide/aws-nvme-drivers.html))
+   - GCP ([gVNIC Network Adapter](https://cloud.google.com/compute/docs/networking/using-gvnic), [GGA Graphics](https://cloud.google.com/compute/docs/instances/enable-instance-virtual-display))
+   - Azure ([MANA Network Adapter](https://learn.microsoft.com/azure/virtual-network/accelerated-networking-mana-windows))
 3. Vista (Server 2008) and 32-bit systems may lack drivers.
 4. For EFI machines without CSM enabled, Windows 7 (Server 2008 R2) cannot be installed.
 5. If the machine has a static IP, the IP will be automatically set after installation.
@@ -176,6 +173,8 @@ Use `Dism++` File menu > Open Image File, select the iso to be installed to get 
 
    <https://massgrave.dev/genuine-installation-media.html> (Recommended, iso sourced from official channels, updated monthly, includes the latest patches)
 
+   <https://www.microsoft.com/software-download/windows8>
+
    <https://www.microsoft.com/software-download/windows10> (Need to open it with a mobile User-Agent)
 
    <https://www.microsoft.com/software-download/windows11>
@@ -184,13 +183,14 @@ Use `Dism++` File menu > Open Image File, select the iso to be installed to get 
 
 | System                                | Traditional Installation | Cloud Image |
 | ------------------------------------- | ------------------------ | ----------- |
-| Debian                                | 384M                     | 512M        |
-| Ubuntu                                | 1G                       | 512M        |
-| CentOS / Alma / Rocky / Fedora        | 1G                       | 512M        |
-| Alpine                                | 256M                     | -           |
+| CentOS / Alma / Rocky                 | -                        | 512M        |
+| Fedora                                | -                        | 512M        |
 | openSUSE                              | -                        | 512M        |
-| Arch                                  | -                        | 512M        |
-| Gentoo                                | -                        | 512M        |
+| Ubuntu                                | -                        | 512M        |
+| Debian                                | 256M                     |             |
+| Alpine                                | 256M                     | -           |
+| Arch                                  | 512M                     | -           |
+| Gentoo                                | 512M                     | -           |
 | Windows 8.1 (Server 2012 R2) or below | 512M                     | -           |
 | Windows 10 (Server 2016) or above     | 1G                       | -           |
 
